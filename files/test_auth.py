@@ -1,6 +1,5 @@
 import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import patch
 
 from auth import AuthContext, AuthMethod, AuthService, get_auth_service
 from auth.settings import Settings

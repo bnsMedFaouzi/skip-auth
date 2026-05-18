@@ -1,5 +1,5 @@
 from enum import StrEnum
-from pydantic import BaseModel
+from pydantic import BaseModel, computed_field
 
 
 class AuthMethod(StrEnum):
@@ -14,6 +14,7 @@ class AuthContext(BaseModel):
     method: AuthMethod
     forwarded_host: str | None = None
 
+    @computed_field
     @property
     def is_internal(self) -> bool:
         return self.method == AuthMethod.TRUSTED_HOST

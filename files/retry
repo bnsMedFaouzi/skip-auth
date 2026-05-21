@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# ── curl_with_retry ───────────────────────────────────────────────────────────
+#  Usage: curl_with_retry <url> <json_data> [max_retries=3] [initial_delay=2]
+#  Exit : 0 on success, 1 if all attempts fail
+#  Output: response body is written to stdout on success
+# ─────────────────────────────────────────────────────────────────────────────
+
+function curl_with_retry() {
+  local -r  url="$1"
+  local -r  data="$2"
+  local -ri max_retries="${3:-3}"
+  local -i  delay="${4:-2}"
+
+  local -i  attempt=1
+  local     http_code response_file
+  response_file=$(mktemp)
+
+  while (( attempt <= max_retries )); do
+    echo "[$(date +%T)] Attempt ${attempt}/${max_retries} → ${url}" >&2
+
+    http_code=$(curl \
+      --silent \
+      --show-error \
+      --output         "${response_file}" \
+      --write-out      "%{http_code}" \
+      --connect-timeout 10 \
+      --max-time        30 \
+      --retry           0 \
+      --request        POST \
+      --header         "Content-Type: application/json" \
+      --data           "${data}" \
+      "${url}")
+
+    if (( http_code >= 200 && http_code < 300 )); then
+      echo "[$(date +%T)] ✓ HTTP ${http_code}" >&2
+      cat "${response_file}"
+      rm -f "${response_file}"
+      return 0
+    fi
+
+    echo "[$(date +%T)] ✗ HTTP ${http_code} — retry in ${delay}s" >&2
+    (( attempt++ ))
+    sleep "${delay}"
+    (( delay *= 2 ))
+  done
+
+  echo "[$(date +%T)] All ${max_retries} attempts failed." >&2
+  rm -f "${response_file}"
+  return 1
+}
+
+# ── Appel ─────────────────────────────────────────────────────────────────────
+
+curl_with_retry \
+  "http://ap27920-data-pull-service:5004/v1/data_pull_service/new/transfer" \
+  "$(generate_post_data)" \
+  3 \
+  2 || {
+    echo "Transfer failed. Aborting." >&2
+    exit 1
+  }

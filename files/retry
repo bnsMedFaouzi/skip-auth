@@ -1,73 +1,85 @@
 import pytest
 from pydantic import ValidationError
-from schemas import Event
+from schemas import Transfer, ProviderSource, CFTEvent
 
 
-# ✅ Cas valides
-def test_valid_event_minimal():
-    event = Event(
-        filename="file.csv",
-        provider_source="s3",
-        bucket_name="my-bucket",
+# ── Transfer ──────────────────────────────────────────────────────────────────
+
+def test_transfer_valid():
+    transfer = Transfer(
+        idf="idf1", nidf="nidf1", idt="idt1", ida="ida1",
+        part="part1", fname="fname1", parm="parm1",
+        fdate="2026-01-01", ftime="12:00:00",
+        cftname="cft1", workingdir="/tmp", bucket_name="my-bucket"
     )
-    assert event.filename == "file.csv"
-    assert event.origin is None
+    assert transfer.idf == "idf1"
+    assert transfer.bucket_name == "my-bucket"
 
 
-def test_valid_event_with_origin():
-    event = Event(
-        filename="file.csv",
-        provider_source="s3",
-        bucket_name="my-bucket",
-        origin={"key": "value"},
-    )
-    assert event.origin == {"key": "value"}
-
-
-# 🔁 Test du validator keep_origin
-def test_keep_origin_sets_origin_to_full_values():
-    event = Event(
-        filename="file.csv",
-        provider_source="s3",
-        bucket_name="my-bucket",
-    )
-    assert event.origin is not None
-    assert event.origin["filename"] == "file.csv"
-    assert event.origin["provider_source"] == "s3"
-    assert event.origin["bucket_name"] == "my-bucket"
-
-
-def test_keep_origin_does_not_override_if_provided():
-    event = Event(
-        filename="file.csv",
-        provider_source="s3",
-        bucket_name="my-bucket",
-        origin={"custom": "data"},
-    )
-    # keep_origin s'exécute avant validation, donc origin sera écrasé par values
-    assert "filename" in event.origin
-
-
-# ❌ Cas invalides
-def test_filename_empty_string_raises():
+def test_transfer_missing_field():
     with pytest.raises(ValidationError):
-        Event(
-            filename="",  # min_length=1
-            provider_source="s3",
-            bucket_name="my-bucket",
+        Transfer(idf="idf1")
+
+
+def test_transfer_invalid_type():
+    with pytest.raises(ValidationError):
+        Transfer(
+            idf=123, nidf="nidf1", idt="idt1", ida="ida1",
+            part="part1", fname="fname1", parm="parm1",
+            fdate="2026-01-01", ftime="12:00:00",
+            cftname="cft1", workingdir="/tmp", bucket_name="my-bucket"
         )
 
 
-def test_missing_filename_raises():
+# ── ProviderSource ────────────────────────────────────────────────────────────
+
+def test_provider_source_valid():
+    ps = ProviderSource(idf="idf1", part="part1", cftname="cft1")
+    assert ps.idf == "idf1"
+    assert ps.cftname == "cft1"
+
+
+def test_provider_source_missing_field():
     with pytest.raises(ValidationError):
-        Event(provider_source="s3", bucket_name="my-bucket")
+        ProviderSource(idf="idf1")
 
 
-def test_missing_provider_source_raises():
+def test_provider_source_invalid_type():
     with pytest.raises(ValidationError):
-        Event(filename="file.csv", bucket_name="my-bucket")
+        ProviderSource(idf=123, part="part1", cftname="cft1")
 
 
-def test_missing_bucket_name_raises():
+# ── CFTEvent ──────────────────────────────────────────────────────────────────
+
+def test_cftevent_valid_with_fname_alias():
+    event = CFTEvent(
+        fname="file.csv",
+        provider_source={"idf": "idf1", "part": "part1", "cftname": "cft1"}
+    )
+    assert event.filename == "file.csv"
+    assert isinstance(event.provider_source, ProviderSource)
+
+
+def test_cftevent_build_provider_source_from_values():
+    # provider_source absent -> construit depuis les valeurs
+    event = CFTEvent(
+        fname="file.csv",
+        idf="idf1", part="part1", cftname="cft1"
+    )
+    assert isinstance(event.provider_source, ProviderSource)
+    assert event.provider_source.idf == "idf1"
+
+
+def test_cftevent_missing_filename():
     with pytest.raises(ValidationError):
-        Event(filename="file.csv", provider_source="s3")
+        CFTEvent(
+            provider_source={"idf": "idf1", "part": "part1", "cftname": "cft1"}
+        )
+
+
+def test_cftevent_filename_alias():
+    event = CFTEvent(
+        fname="data.json",
+        provider_source={"idf": "idf1", "part": "part1", "cftname": "cft1"}
+    )
+    assert event.filename == "data.json"

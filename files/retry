@@ -6,80 +6,83 @@ from schemas import Transfer, ProviderSource, CFTEvent
 # ── Transfer ──────────────────────────────────────────────────────────────────
 
 def test_transfer_valid():
-    transfer = Transfer(
-        idf="idf1", nidf="nidf1", idt="idt1", ida="ida1",
-        part="part1", fname="fname1", parm="parm1",
-        fdate="2026-01-01", ftime="12:00:00",
-        cftname="cft1", workingdir="/tmp", bucket_name="my-bucket"
-    )
+    transfer = Transfer.model_validate({
+        "idf": "idf1", "nidf": "nidf1", "idt": "idt1", "ida": "ida1",
+        "part": "part1", "fname": "fname1", "parm": "parm1",
+        "fdate": "2026-01-01", "ftime": "12:00:00",
+        "cftname": "cft1", "workingdir": "/tmp", "bucket_name": "my-bucket"
+    })
     assert transfer.idf == "idf1"
     assert transfer.bucket_name == "my-bucket"
 
 
 def test_transfer_missing_field():
     with pytest.raises(ValidationError):
-        Transfer(idf="idf1")
+        Transfer.model_validate({"idf": "idf1"})
 
 
 def test_transfer_invalid_type():
     with pytest.raises(ValidationError):
-        Transfer(
-            idf=123, nidf="nidf1", idt="idt1", ida="ida1",
-            part="part1", fname="fname1", parm="parm1",
-            fdate="2026-01-01", ftime="12:00:00",
-            cftname="cft1", workingdir="/tmp", bucket_name="my-bucket"
-        )
+        Transfer.model_validate({
+            "idf": 123, "nidf": "nidf1", "idt": "idt1", "ida": "ida1",
+            "part": "part1", "fname": "fname1", "parm": "parm1",
+            "fdate": "2026-01-01", "ftime": "12:00:00",
+            "cftname": "cft1", "workingdir": "/tmp", "bucket_name": "my-bucket"
+        })
 
 
 # ── ProviderSource ────────────────────────────────────────────────────────────
 
 def test_provider_source_valid():
-    ps = ProviderSource(idf="idf1", part="part1", cftname="cft1")
+    ps = ProviderSource.model_validate({
+        "idf": "idf1", "part": "part1", "cftname": "cft1"
+    })
     assert ps.idf == "idf1"
     assert ps.cftname == "cft1"
 
 
 def test_provider_source_missing_field():
     with pytest.raises(ValidationError):
-        ProviderSource(idf="idf1")
+        ProviderSource.model_validate({"idf": "idf1"})
 
 
 def test_provider_source_invalid_type():
     with pytest.raises(ValidationError):
-        ProviderSource(idf=123, part="part1", cftname="cft1")
+        ProviderSource.model_validate({
+            "idf": 123, "part": "part1", "cftname": "cft1"
+        })
 
 
 # ── CFTEvent ──────────────────────────────────────────────────────────────────
 
 def test_cftevent_valid_with_fname_alias():
-    event = CFTEvent(
-        fname="file.csv",
-        provider_source={"idf": "idf1", "part": "part1", "cftname": "cft1"}
-    )
+    event = CFTEvent.model_validate({
+        "fname": "file.csv",
+        "provider_source": {"idf": "idf1", "part": "part1", "cftname": "cft1"}
+    })
     assert event.filename == "file.csv"
     assert isinstance(event.provider_source, ProviderSource)
 
 
 def test_cftevent_build_provider_source_from_values():
-    # provider_source absent -> construit depuis les valeurs
-    event = CFTEvent(
-        fname="file.csv",
-        idf="idf1", part="part1", cftname="cft1"
-    )
+    event = CFTEvent.model_validate({
+        "fname": "file.csv",
+        "idf": "idf1", "part": "part1", "cftname": "cft1"
+    })
     assert isinstance(event.provider_source, ProviderSource)
     assert event.provider_source.idf == "idf1"
 
 
 def test_cftevent_missing_filename():
     with pytest.raises(ValidationError):
-        CFTEvent(
-            provider_source={"idf": "idf1", "part": "part1", "cftname": "cft1"}
-        )
+        CFTEvent.model_validate({
+            "provider_source": {"idf": "idf1", "part": "part1", "cftname": "cft1"}
+        })
 
 
 def test_cftevent_filename_alias():
-    event = CFTEvent(
-        fname="data.json",
-        provider_source={"idf": "idf1", "part": "part1", "cftname": "cft1"}
-    )
+    event = CFTEvent.model_validate({
+        "fname": "data.json",
+        "provider_source": {"idf": "idf1", "part": "part1", "cftname": "cft1"}
+    })
     assert event.filename == "data.json"

@@ -1,41 +1,146 @@
-from datetime import datetime, timezone
+import pytest
+from unittest.mock import MagicMock, AsyncMock, patch
+from fastapi import Request
+from authentication.skip_auth.dependencies import get_auth_service, get_auth_context
+from authentication.skip_auth.services import AuthService
+from authentication.skip_auth.models import AuthContext, AuthMethod
 
-MOCK_CLAIMS = {
-    "client_id": "client_123",
-    "scope": ["read", "write"],
-    "iss": "https://issuer.example.com",
-    "exp": 9999999999,
-    "iat": 1700000000,
-    "uid": "user_123",
-    "given_name": "John",
-    "family_name": "Doe",
-    "email": "john.doe@example.com",
-    "name": "John Doe",
-    "external_user": False,
-}
 
-MOCK_TOKEN_DETAIL = TokenDetail(
-    code=200,
-    detail="OK",
-    claims=MOCK_CLAIMS
+# ── Fixtures ──────────────────────────────────────────────────────────────────
+
+def make_request(forwarded_host: str | None = None) -> Request:
+    headers = {}
+    if forwarded_host:
+        headers["x-forwarded-host"] = forwarded_host
+    scope = {
+        "type": "http",
+        "headers": [(k.encode(), v.encode()) for k, v in headers.items()],
+    }
+    return Request(scope)
+
+
+MOCK_SECURITY_SCOPES = MagicMock()
+MOCK_AUTH_CONTEXT_INTERNAL = AuthContext(
+    user="internal",
+    method=AuthMethod.TRUSTED_HOST
+)
+MOCK_AUTH_CONTEXT_OAUTH2 = AuthContext(
+    user="authenticated",
+    method=AuthMethod.OAUTH2,
+    token=MagicMock()
 )
 
-def test_authenticate_oauth2_returns_auth_context():
-    service = AuthService()
-    with patch.object(AuthService, "_verify_token", return_value=MOCK_TOKEN_DETAIL):
-        result = service.authenticate_oauth2(
-            security_scopes=MOCK_SECURITY_SCOPES,
-            authorization=VALID_AUTHORIZATION
-        )
-        assert isinstance(result, AuthContext)
-        assert result.user == "authenticated"
-        assert result.method == AuthMethod.OAUTH2
-        assert result.token == MOCK_TOKEN_DETAIL
 
-def test_authenticate_oauth2_empty_string_raises_missing_token_error():
-    service = AuthService()
-    with pytest.raises(MissingTokenError):
-        service.authenticate_oauth2(
-            security_scopes=MOCK_SECURITY_SCOPES,
-            authorization=""
-        )
+# ── get_auth_service ──────────────────────────────────────────────────────────
+
+def test_get_auth_service_returns_auth_service_instance():
+    result = get_auth_service()
+    assert isinstance(result, AuthService)
+
+
+# ── get_auth_context ──────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_get_auth_context_no_forwarded_host_calls_authenticate_internal():
+    request = make_request(forwarded_host=None)
+    mock_service = MagicMock()
+    mock_service.authenticate_internal.return_value = MOCK_AUTH_CONTEXT_INTERNAL
+
+    result = await get_auth_context(
+        request=request,
+        security_scopes=MOCK_SECURITY_SCOPES,
+        authorization="Bearer token",
+        check_audience=True,
+        service=mock_service
+    )
+
+    mock_service.authenticate_internal.assert_called_once()
+    assert result == MOCK_AUTH_CONTEXT_INTERNAL
+
+
+@pytest.mark.asyncio
+async def test_get_auth_context_no_forwarded_host_returns_internal_auth_context():
+    request = make_request(forwarded_host=None)
+    mock_service = MagicMock()
+    mock_service.authenticate_internal.return_value = MOCK_AUTH_CONTEXT_INTERNAL
+
+    result = await get_auth_context(
+        request=request,
+        security_scopes=MOCK_SECURITY_SCOPES,
+        authorization="Bearer token",
+        service=mock_service
+    )
+
+    assert result.method == AuthMethod.TRUSTED_HOST
+    assert result.user == "internal"
+
+
+@pytest.mark.asyncio
+async def test_get_auth_context_with_forwarded_host_calls_authenticate_oauth2():
+    request = make_request(forwarded_host="external.host.com")
+    mock_service = MagicMock()
+    mock_service.authenticate_oauth2.return_value = MOCK_AUTH_CONTEXT_OAUTH2
+
+    result = await get_auth_context(
+        request=request,
+        security_scopes=MOCK_SECURITY_SCOPES,
+        authorization="Bearer token",
+        check_audience=True,
+        service=mock_service
+    )
+
+    mock_service.authenticate_oauth2.assert_called_once_with(
+        security_scopes=MOCK_SECURITY_SCOPES,
+        authorization="Bearer token",
+        check_audience=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_auth_context_with_forwarded_host_returns_oauth2_auth_context():
+    request = make_request(forwarded_host="external.host.com")
+    mock_service = MagicMock()
+    mock_service.authenticate_oauth2.return_value = MOCK_AUTH_CONTEXT_OAUTH2
+
+    result = await get_auth_context(
+        request=request,
+        security_scopes=MOCK_SECURITY_SCOPES,
+        authorization="Bearer token",
+        service=mock_service
+    )
+
+    assert result.method == AuthMethod.OAUTH2
+    assert result.user == "authenticated"
+
+
+@pytest.mark.asyncio
+async def test_get_auth_context_check_audience_default_is_true():
+    request = make_request(forwarded_host="external.host.com")
+    mock_service = MagicMock()
+    mock_service.authenticate_oauth2.return_value = MOCK_AUTH_CONTEXT_OAUTH2
+
+    await get_auth_context(
+        request=request,
+        security_scopes=MOCK_SECURITY_SCOPES,
+        authorization="Bearer token",
+        service=mock_service
+    )
+
+    call_kwargs = mock_service.authenticate_oauth2.call_args.kwargs
+    assert call_kwargs["check_audience"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_auth_context_does_not_call_oauth2_when_no_forwarded_host():
+    request = make_request(forwarded_host=None)
+    mock_service = MagicMock()
+    mock_service.authenticate_internal.return_value = MOCK_AUTH_CONTEXT_INTERNAL
+
+    await get_auth_context(
+        request=request,
+        security_scopes=MOCK_SECURITY_SCOPES,
+        authorization="Bearer token",
+        service=mock_service
+    )
+
+    mock_service.authenticate_oauth2.assert_not_called()

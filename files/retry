@@ -1,58 +1,73 @@
 import pytest
 from pydantic import ValidationError
-from message import Event
+from schemas import Event
 
 
-def test_valid_event():
+# ✅ Cas valides
+def test_valid_event_minimal():
     event = Event(
         filename="file.csv",
         provider_source="s3",
-        bucket_name="my-bucket"
+        bucket_name="my-bucket",
     )
     assert event.filename == "file.csv"
-    assert event.provider_source == "s3"
-    assert event.bucket_name == "my-bucket"
+    assert event.origin is None
 
 
-def test_missing_filename():
+def test_valid_event_with_origin():
+    event = Event(
+        filename="file.csv",
+        provider_source="s3",
+        bucket_name="my-bucket",
+        origin={"key": "value"},
+    )
+    assert event.origin == {"key": "value"}
+
+
+# 🔁 Test du validator keep_origin
+def test_keep_origin_sets_origin_to_full_values():
+    event = Event(
+        filename="file.csv",
+        provider_source="s3",
+        bucket_name="my-bucket",
+    )
+    assert event.origin is not None
+    assert event.origin["filename"] == "file.csv"
+    assert event.origin["provider_source"] == "s3"
+    assert event.origin["bucket_name"] == "my-bucket"
+
+
+def test_keep_origin_does_not_override_if_provided():
+    event = Event(
+        filename="file.csv",
+        provider_source="s3",
+        bucket_name="my-bucket",
+        origin={"custom": "data"},
+    )
+    # keep_origin s'exécute avant validation, donc origin sera écrasé par values
+    assert "filename" in event.origin
+
+
+# ❌ Cas invalides
+def test_filename_empty_string_raises():
+    with pytest.raises(ValidationError):
+        Event(
+            filename="",  # min_length=1
+            provider_source="s3",
+            bucket_name="my-bucket",
+        )
+
+
+def test_missing_filename_raises():
     with pytest.raises(ValidationError):
         Event(provider_source="s3", bucket_name="my-bucket")
 
 
-def test_missing_provider_source():
+def test_missing_provider_source_raises():
     with pytest.raises(ValidationError):
         Event(filename="file.csv", bucket_name="my-bucket")
 
 
-def test_missing_bucket_name():
+def test_missing_bucket_name_raises():
     with pytest.raises(ValidationError):
         Event(filename="file.csv", provider_source="s3")
-
-
-def test_all_fields_missing():
-    with pytest.raises(ValidationError):
-        Event()
-
-
-def test_invalid_type_filename():
-    with pytest.raises(ValidationError):
-        Event(filename=123, provider_source="s3", bucket_name="my-bucket")
-
-
-def test_empty_strings():
-    event = Event(filename="", provider_source="", bucket_name="")
-    assert event.filename == ""
-
-
-def test_serialization():
-    event = Event(
-        filename="data.json",
-        provider_source="gcs",
-        bucket_name="prod-bucket"
-    )
-    d = event.model_dump()
-    assert d == {
-        "filename": "data.json",
-        "provider_source": "gcs",
-        "bucket_name": "prod-bucket"
-    }

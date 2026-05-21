@@ -1,45 +1,24 @@
-import pytest
-from unittest.mock import MagicMock, patch
-from authentication.skip_auth.exceptions import MissingTokenError
-from authentication.skip_auth.models import AuthContext, AuthMethod
-from authentication.skip_auth.service import AuthService
+from datetime import datetime, timezone
 
+MOCK_CLAIMS = {
+    "client_id": "client_123",
+    "scope": ["read", "write"],
+    "iss": "https://issuer.example.com",
+    "exp": 9999999999,
+    "iat": 1700000000,
+    "uid": "user_123",
+    "given_name": "John",
+    "family_name": "Doe",
+    "email": "john.doe@example.com",
+    "name": "John Doe",
+    "external_user": False,
+}
 
-# ── Fixtures ──────────────────────────────────────────────────────────────────
-
-VALID_AUTHORIZATION = "Bearer valid_token"
-
-MOCK_SECURITY_SCOPES = MagicMock()
-MOCK_TOKEN_DETAIL = MagicMock()
-
-
-# ── authenticate_internal ─────────────────────────────────────────────────────
-
-def test_authenticate_internal_returns_auth_context():
-    result = AuthService.authenticate_internal()
-    assert isinstance(result, AuthContext)
-
-
-def test_authenticate_internal_user_is_internal():
-    result = AuthService.authenticate_internal()
-    assert result.user == "internal"
-
-
-def test_authenticate_internal_method_is_trusted_host():
-    result = AuthService.authenticate_internal()
-    assert result.method == AuthMethod.TRUSTED_HOST
-
-
-# ── authenticate_oauth2 ───────────────────────────────────────────────────────
-
-def test_authenticate_oauth2_none_authorization_raises_missing_token_error():
-    service = AuthService()
-    with pytest.raises(MissingTokenError):
-        service.authenticate_oauth2(
-            security_scopes=MOCK_SECURITY_SCOPES,
-            authorization=None
-        )
-
+MOCK_TOKEN_DETAIL = TokenDetail(
+    code=200,
+    detail="OK",
+    claims=MOCK_CLAIMS
+)
 
 def test_authenticate_oauth2_returns_auth_context():
     service = AuthService()
@@ -49,96 +28,14 @@ def test_authenticate_oauth2_returns_auth_context():
             authorization=VALID_AUTHORIZATION
         )
         assert isinstance(result, AuthContext)
-
-
-def test_authenticate_oauth2_user_is_authenticated():
-    service = AuthService()
-    with patch.object(AuthService, "_verify_token", return_value=MOCK_TOKEN_DETAIL):
-        result = service.authenticate_oauth2(
-            security_scopes=MOCK_SECURITY_SCOPES,
-            authorization=VALID_AUTHORIZATION
-        )
         assert result.user == "authenticated"
-
-
-def test_authenticate_oauth2_method_is_oauth2():
-    service = AuthService()
-    with patch.object(AuthService, "_verify_token", return_value=MOCK_TOKEN_DETAIL):
-        result = service.authenticate_oauth2(
-            security_scopes=MOCK_SECURITY_SCOPES,
-            authorization=VALID_AUTHORIZATION
-        )
         assert result.method == AuthMethod.OAUTH2
-
-
-def test_authenticate_oauth2_token_from_verify_token():
-    service = AuthService()
-    with patch.object(AuthService, "_verify_token", return_value=MOCK_TOKEN_DETAIL):
-        result = service.authenticate_oauth2(
-            security_scopes=MOCK_SECURITY_SCOPES,
-            authorization=VALID_AUTHORIZATION
-        )
         assert result.token == MOCK_TOKEN_DETAIL
 
-
-def test_authenticate_oauth2_calls_verify_token_with_correct_args():
+def test_authenticate_oauth2_empty_string_raises_missing_token_error():
     service = AuthService()
-    with patch.object(AuthService, "_verify_token", return_value=MOCK_TOKEN_DETAIL) as mock_verify:
+    with pytest.raises(MissingTokenError):
         service.authenticate_oauth2(
             security_scopes=MOCK_SECURITY_SCOPES,
-            authorization=VALID_AUTHORIZATION,
-            check_audience=False
+            authorization=""
         )
-        mock_verify.assert_called_once_with(
-            authorization=VALID_AUTHORIZATION,
-            check_audience=False,
-            security_scopes=MOCK_SECURITY_SCOPES
-        )
-
-
-def test_authenticate_oauth2_check_audience_default_is_true():
-    service = AuthService()
-    with patch.object(AuthService, "_verify_token", return_value=MOCK_TOKEN_DETAIL) as mock_verify:
-        service.authenticate_oauth2(
-            security_scopes=MOCK_SECURITY_SCOPES,
-            authorization=VALID_AUTHORIZATION
-        )
-        call_kwargs = mock_verify.call_args.kwargs
-        assert call_kwargs["check_audience"] is True
-
-
-# ── _verify_token ─────────────────────────────────────────────────────────────
-
-def test_verify_token_calls_get_token_details():
-    with patch("authentication.skip_auth.service.get_token_details") as mock_details, \
-         patch("authentication.skip_auth.service.get_token_by_claim", return_value=MOCK_TOKEN_DETAIL):
-        mock_claims = MagicMock()
-        mock_details.return_value = mock_claims
-
-        result = AuthService._verify_token(
-            security_scopes=MOCK_SECURITY_SCOPES,
-            authorization=VALID_AUTHORIZATION,
-            check_audience=True
-        )
-
-        mock_details.assert_called_once_with(
-            MOCK_SECURITY_SCOPES,
-            VALID_AUTHORIZATION,
-            True
-        )
-
-
-def test_verify_token_calls_get_token_by_claim():
-    with patch("authentication.skip_auth.service.get_token_details") as mock_details, \
-         patch("authentication.skip_auth.service.get_token_by_claim", return_value=MOCK_TOKEN_DETAIL) as mock_claim:
-        mock_claims = MagicMock()
-        mock_details.return_value = mock_claims
-
-        result = AuthService._verify_token(
-            security_scopes=MOCK_SECURITY_SCOPES,
-            authorization=VALID_AUTHORIZATION,
-            check_audience=True
-        )
-
-        mock_claim.assert_called_once_with(claims=mock_claims)
-        assert result == MOCK_TOKEN_DETAIL

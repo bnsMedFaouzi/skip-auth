@@ -1,12 +1,18 @@
 import pytest
-from unittest.mock import MagicMock, patch
-from pydantic import ValidationError
-from platforms.cft.platform import Cft
-from platforms.cft.schemas import Transfer, CFTEvent, ProviderSource
+from unittest.mock import MagicMock, patch, AsyncMock
+from fastapi.testclient import TestClient
+from fastapi import FastAPI
+from starlette import status
+
+from routes import router
 from base import RequestValidationError
 
 
-# ── Fixtures ──────────────────────────────────────────────────────────────────
+# ── Setup ─────────────────────────────────────────────────────────────────────
+
+app = FastAPI()
+app.include_router(router)
+client = TestClient(app)
 
 VALID_DATA = {
     "idf": "idf1",
@@ -24,114 +30,90 @@ VALID_DATA = {
 }
 
 
-# ── __init__ ──────────────────────────────────────────────────────────────────
+# ── new_transfer ──────────────────────────────────────────────────────────────
 
-def test_cft_init_valid_data():
-    platform = Cft(VALID_DATA)
-    assert isinstance(platform._request_data, Transfer)
+def test_new_transfer_valid_returns_204():
+    with patch("routes.PlatformFactory") as MockFactory:
+        mock_platform = MagicMock()
+        MockFactory.return_value.return_value = mock_platform
 
-
-def test_cft_init_missing_field_raises_request_validation_error():
-    with pytest.raises(RequestValidationError):
-        Cft({"idf": "idf1"})
-
-
-def test_cft_init_invalid_type_raises_request_validation_error():
-    data = {**VALID_DATA, "idf": 123}
-    with pytest.raises(RequestValidationError):
-        Cft(data)
+        response = client.post(
+            "/new/transfer/CFT",
+            json=VALID_DATA
+        )
+        assert response.status_code == status.HTTP_204_NO_CONTENT
 
 
-# ── schemas ───────────────────────────────────────────────────────────────────
+def test_new_transfer_calls_platform_factory_with_platform_name():
+    with patch("routes.PlatformFactory") as MockFactory:
+        mock_platform = MagicMock()
+        MockFactory.return_value.return_value = mock_platform
 
-def test_cft_request_schema_is_transfer():
-    platform = Cft(VALID_DATA)
-    assert platform._get_request_schema_class() == Transfer
+        client.post("/new/transfer/CFT", json=VALID_DATA)
 
-
-def test_cft_event_schema_is_cftevent():
-    platform = Cft(VALID_DATA)
-    assert platform._get_event_schema_class() == CFTEvent
+        MockFactory.assert_called_once_with(platform_name="CFT")
 
 
-def test_cft_platform_name():
-    platform = Cft(VALID_DATA)
-    assert platform.__PLATFORM_NAME__ == "CFT"
+def test_new_transfer_calls_send_kafka_message():
+    with patch("routes.PlatformFactory") as MockFactory:
+        mock_platform = MagicMock()
+        MockFactory.return_value.return_value = mock_platform
+
+        client.post("/new/transfer/CFT", json=VALID_DATA)
+
+        mock_platform.send_kafka_message.assert_called_once_with(
+            producer_settings=pytest.ANY
+        )
 
 
-# ── serialize_event ───────────────────────────────────────────────────────────
-
-def test_cft_serialize_event_returns_cftevent_instance():
-    platform = Cft(VALID_DATA)
-    event = platform.serialize_event()
-    assert isinstance(event, CFTEvent)
-
-
-def test_cft_serialize_event_filename_from_fname_alias():
-    platform = Cft(VALID_DATA)
-    event = platform.serialize_event()
-    assert event.filename == "file.csv"
+def test_new_transfer_invalid_platform_returns_422():
+    response = client.post(
+        "/new/transfer/INVALID_PLATFORM",
+        json=VALID_DATA
+    )
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
 
 
-def test_cft_serialize_event_provider_source_is_built():
-    platform = Cft(VALID_DATA)
-    event = platform.serialize_event()
-    assert isinstance(event.provider_source, ProviderSource)
-    assert event.provider_source.idf == "idf1"
-    assert event.provider_source.part == "part1"
-    assert event.provider_source.cftname == "cft1"
+def test_new_transfer_empty_body_returns_422():
+    response = client.post(
+        "/new/transfer/CFT",
+        json={}
+    )
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
 
 
-def test_cft_serialize_event_dump_contains_filename():
-    platform = Cft(VALID_DATA)
-    event = platform.serialize_event()
-    dump = event.model_dump()
-    assert dump["filename"] == "file.csv"
+def test_new_transfer_request_validation_error_returns_400():
+    with patch("routes.PlatformFactory") as MockFactory:
+        MockFactory.return_value.side_effect = RequestValidationError([
+            {"msg": "field required", "loc": ["fname"]}
+        ])
+
+        response = client.post("/new/transfer/CFT", json=VALID_DATA)
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
 
 
-def test_cft_serialize_event_dump_contains_provider_source():
-    platform = Cft(VALID_DATA)
-    event = platform.serialize_event()
-    dump = event.model_dump()
-    assert "provider_source" in dump
-    assert dump["provider_source"]["idf"] == "idf1"
+def test_new_transfer_logs_platform_name():
+    with patch("routes.PlatformFactory") as MockFactory, \
+         patch("routes.logger") as mock_logger:
+        mock_platform = MagicMock()
+        MockFactory.return_value.return_value = mock_platform
+
+        client.post("/new/transfer/CFT", json=VALID_DATA)
+
+        mock_logger.info.assert_called_once()
+        call_args = mock_logger.info.call_args
+        assert "CFT" in call_args[0][0]
 
 
-# ── send_kafka_message ────────────────────────────────────────────────────────
+def test_new_transfer_logger_extra_contains_transfer_and_auth():
+    with patch("routes.PlatformFactory") as MockFactory, \
+         patch("routes.logger") as mock_logger:
+        mock_platform = MagicMock()
+        MockFactory.return_value.return_value = mock_platform
 
-def test_cft_send_kafka_message_calls_produce_event():
-    platform = Cft(VALID_DATA)
+        client.post("/new/transfer/CFT", json=VALID_DATA)
 
-    with patch("base.DefaultProducer") as MockProducer:
-        mock_producer_instance = MagicMock()
-        MockProducer.return_value = mock_producer_instance
-
-        platform.send_kafka_message(MagicMock())
-
-        mock_producer_instance.produce_event.assert_called_once()
-
-
-def test_cft_send_kafka_message_headers_contain_platform_name():
-    platform = Cft(VALID_DATA)
-
-    with patch("base.DefaultProducer") as MockProducer:
-        mock_producer_instance = MagicMock()
-        MockProducer.return_value = mock_producer_instance
-
-        platform.send_kafka_message(MagicMock())
-
-        call_kwargs = mock_producer_instance.produce_event.call_args.kwargs
-        assert platform.__PLATFORM_NAME__ in call_kwargs["headers"]
-
-
-def test_cft_send_kafka_message_value_is_json_string():
-    platform = Cft(VALID_DATA)
-
-    with patch("base.DefaultProducer") as MockProducer:
-        mock_producer_instance = MagicMock()
-        MockProducer.return_value = mock_producer_instance
-
-        platform.send_kafka_message(MagicMock())
-
-        call_kwargs = mock_producer_instance.produce_event.call_args.kwargs
-        assert isinstance(call_kwargs["value"], str)
+        call_kwargs = mock_logger.info.call_args.kwargs
+        assert "transfer" in call_kwargs["extra"]
+        assert "auth" in call_kwargs["extra"]

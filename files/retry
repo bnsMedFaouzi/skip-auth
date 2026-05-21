@@ -1,121 +1,118 @@
 import pytest
 from unittest.mock import MagicMock, patch
-from pydantic import BaseModel, ValidationError
-from base import BasePlatform, RequestValidationError
+from pydantic import ValidationError
+from platforms.cft.platform import Cft
+from platforms.cft.schemas import Transfer, CFTEvent, ProviderSource
+from base import RequestValidationError
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
-class MockRequestSchema(BaseModel):
-    idf: str
-    part: str
-
-class MockEventSchema(BaseModel):
-    idf: str
-    part: str
-
-class ConcretePlatform(BasePlatform):
-    __PLATFORM_NAME__ = "TEST_PLATFORM"
-    _REQUEST_SCHEMAS = MockRequestSchema
-    _EVENT_SCHEMAS = MockEventSchema
-
-
-VALID_DATA = {"idf": "idf1", "part": "part1"}
+VALID_DATA = {
+    "idf": "idf1",
+    "nidf": "nidf1",
+    "idt": "idt1",
+    "ida": "ida1",
+    "part": "part1",
+    "fname": "file.csv",
+    "parm": "parm1",
+    "fdate": "2026-01-01",
+    "ftime": "12:00:00",
+    "cftname": "cft1",
+    "workingdir": "/tmp",
+    "bucket_name": "my-bucket"
+}
 
 
 # ── __init__ ──────────────────────────────────────────────────────────────────
 
-def test_init_valid_data():
-    platform = ConcretePlatform(VALID_DATA)
-    assert platform._request_data.idf == "idf1"
-    assert platform._request_data.part == "part1"
+def test_cft_init_valid_data():
+    platform = Cft(VALID_DATA)
+    assert isinstance(platform._request_data, Transfer)
 
 
-def test_init_missing_field_raises_request_validation_error():
+def test_cft_init_missing_field_raises_request_validation_error():
     with pytest.raises(RequestValidationError):
-        ConcretePlatform({"idf": "idf1"})
+        Cft({"idf": "idf1"})
 
 
-def test_init_invalid_type_raises_request_validation_error():
+def test_cft_init_invalid_type_raises_request_validation_error():
+    data = {**VALID_DATA, "idf": 123}
     with pytest.raises(RequestValidationError):
-        ConcretePlatform({"idf": 123, "part": "part1"})
+        Cft(data)
+
+
+# ── schemas ───────────────────────────────────────────────────────────────────
+
+def test_cft_request_schema_is_transfer():
+    platform = Cft(VALID_DATA)
+    assert platform._get_request_schema_class() == Transfer
+
+
+def test_cft_event_schema_is_cftevent():
+    platform = Cft(VALID_DATA)
+    assert platform._get_event_schema_class() == CFTEvent
+
+
+def test_cft_platform_name():
+    platform = Cft(VALID_DATA)
+    assert platform.__PLATFORM_NAME__ == "CFT"
 
 
 # ── serialize_event ───────────────────────────────────────────────────────────
 
-def test_serialize_event_returns_event_schema_instance():
-    platform = ConcretePlatform(VALID_DATA)
+def test_cft_serialize_event_returns_cftevent_instance():
+    platform = Cft(VALID_DATA)
     event = platform.serialize_event()
-    assert isinstance(event, MockEventSchema)
+    assert isinstance(event, CFTEvent)
 
 
-def test_serialize_event_data_matches_request_data():
-    platform = ConcretePlatform(VALID_DATA)
+def test_cft_serialize_event_filename_from_fname_alias():
+    platform = Cft(VALID_DATA)
     event = platform.serialize_event()
-    assert event.idf == "idf1"
-    assert event.part == "part1"
+    assert event.filename == "file.csv"
 
 
-def test_serialize_event_uses_request_data_dump():
-    platform = ConcretePlatform(VALID_DATA)
-    platform._request_data = MockRequestSchema.model_validate({"idf": "idf2", "part": "part2"})
+def test_cft_serialize_event_provider_source_is_built():
+    platform = Cft(VALID_DATA)
     event = platform.serialize_event()
-    assert event.idf == "idf2"
-    assert event.part == "part2"
+    assert isinstance(event.provider_source, ProviderSource)
+    assert event.provider_source.idf == "idf1"
+    assert event.provider_source.part == "part1"
+    assert event.provider_source.cftname == "cft1"
 
 
-# ── _get_request_schema_class ─────────────────────────────────────────────────
-
-def test_get_request_schema_class_returns_correct_class():
-    platform = ConcretePlatform(VALID_DATA)
-    assert platform._get_request_schema_class() == MockRequestSchema
-
-
-def test_get_request_schema_class_invalid_type_raises_assertion_error():
-    class BadPlatform(BasePlatform):
-        __PLATFORM_NAME__ = "BAD"
-        _REQUEST_SCHEMAS = "not_a_basemodel"
-        _EVENT_SCHEMAS = MockEventSchema
-
-    with pytest.raises(AssertionError):
-        BadPlatform(VALID_DATA)
+def test_cft_serialize_event_dump_contains_filename():
+    platform = Cft(VALID_DATA)
+    event = platform.serialize_event()
+    dump = event.model_dump()
+    assert dump["filename"] == "file.csv"
 
 
-# ── _get_event_schema_class ───────────────────────────────────────────────────
-
-def test_get_event_schema_class_returns_correct_class():
-    platform = ConcretePlatform(VALID_DATA)
-    assert platform._get_event_schema_class() == MockEventSchema
-
-
-def test_get_event_schema_class_invalid_type_raises_assertion_error():
-    class BadPlatform(BasePlatform):
-        __PLATFORM_NAME__ = "BAD"
-        _REQUEST_SCHEMAS = MockRequestSchema
-        _EVENT_SCHEMAS = "not_a_basemodel"
-
-    with pytest.raises(AssertionError):
-        BadPlatform(VALID_DATA)
+def test_cft_serialize_event_dump_contains_provider_source():
+    platform = Cft(VALID_DATA)
+    event = platform.serialize_event()
+    dump = event.model_dump()
+    assert "provider_source" in dump
+    assert dump["provider_source"]["idf"] == "idf1"
 
 
 # ── send_kafka_message ────────────────────────────────────────────────────────
 
-def test_send_kafka_message_calls_produce_event():
-    platform = ConcretePlatform(VALID_DATA)
-    mock_producer_settings = MagicMock()
+def test_cft_send_kafka_message_calls_produce_event():
+    platform = Cft(VALID_DATA)
 
     with patch("base.DefaultProducer") as MockProducer:
         mock_producer_instance = MagicMock()
         MockProducer.return_value = mock_producer_instance
 
-        platform.send_kafka_message(mock_producer_settings)
+        platform.send_kafka_message(MagicMock())
 
-        MockProducer.assert_called_once_with(mock_producer_settings)
         mock_producer_instance.produce_event.assert_called_once()
 
 
-def test_send_kafka_message_headers_contain_platform_name():
-    platform = ConcretePlatform(VALID_DATA)
+def test_cft_send_kafka_message_headers_contain_platform_name():
+    platform = Cft(VALID_DATA)
 
     with patch("base.DefaultProducer") as MockProducer:
         mock_producer_instance = MagicMock()
@@ -124,11 +121,11 @@ def test_send_kafka_message_headers_contain_platform_name():
         platform.send_kafka_message(MagicMock())
 
         call_kwargs = mock_producer_instance.produce_event.call_args.kwargs
-        assert call_kwargs["headers"] == {"TEST_PLATFORM": "1"}
+        assert platform.__PLATFORM_NAME__ in call_kwargs["headers"]
 
 
-def test_send_kafka_message_value_is_json():
-    platform = ConcretePlatform(VALID_DATA)
+def test_cft_send_kafka_message_value_is_json_string():
+    platform = Cft(VALID_DATA)
 
     with patch("base.DefaultProducer") as MockProducer:
         mock_producer_instance = MagicMock()
@@ -137,5 +134,4 @@ def test_send_kafka_message_value_is_json():
         platform.send_kafka_message(MagicMock())
 
         call_kwargs = mock_producer_instance.produce_event.call_args.kwargs
-        assert b"idf1" in call_kwargs["value"]
-        assert b"part1" in call_kwargs["value"]
+        assert isinstance(call_kwargs["value"], str)

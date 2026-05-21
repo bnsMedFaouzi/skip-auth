@@ -1,61 +1,58 @@
-#!/usr/bin/env bash
-# ── curl_with_retry ───────────────────────────────────────────────────────────
-#  Usage: curl_with_retry <url> <json_data> [max_retries=3] [initial_delay=2]
-#  Exit : 0 on success, 1 if all attempts fail
-#  Output: response body is written to stdout on success
-# ─────────────────────────────────────────────────────────────────────────────
+import pytest
+from pydantic import ValidationError
+from message import Event
 
-function curl_with_retry() {
-  local -r  url="$1"
-  local -r  data="$2"
-  local -ri max_retries="${3:-3}"
-  local -i  delay="${4:-2}"
 
-  local -i  attempt=1
-  local     http_code response_file
-  response_file=$(mktemp)
+def test_valid_event():
+    event = Event(
+        filename="file.csv",
+        provider_source="s3",
+        bucket_name="my-bucket"
+    )
+    assert event.filename == "file.csv"
+    assert event.provider_source == "s3"
+    assert event.bucket_name == "my-bucket"
 
-  while (( attempt <= max_retries )); do
-    echo "[$(date +%T)] Attempt ${attempt}/${max_retries} → ${url}" >&2
 
-    http_code=$(curl \
-      --silent \
-      --show-error \
-      --output         "${response_file}" \
-      --write-out      "%{http_code}" \
-      --connect-timeout 10 \
-      --max-time        30 \
-      --retry           0 \
-      --request        POST \
-      --header         "Content-Type: application/json" \
-      --data           "${data}" \
-      "${url}")
+def test_missing_filename():
+    with pytest.raises(ValidationError):
+        Event(provider_source="s3", bucket_name="my-bucket")
 
-    if (( http_code >= 200 && http_code < 300 )); then
-      echo "[$(date +%T)] ✓ HTTP ${http_code}" >&2
-      cat "${response_file}"
-      rm -f "${response_file}"
-      return 0
-    fi
 
-    echo "[$(date +%T)] ✗ HTTP ${http_code} — retry in ${delay}s" >&2
-    (( attempt++ ))
-    sleep "${delay}"
-    (( delay *= 2 ))
-  done
+def test_missing_provider_source():
+    with pytest.raises(ValidationError):
+        Event(filename="file.csv", bucket_name="my-bucket")
 
-  echo "[$(date +%T)] All ${max_retries} attempts failed." >&2
-  rm -f "${response_file}"
-  return 1
-}
 
-# ── Appel ─────────────────────────────────────────────────────────────────────
+def test_missing_bucket_name():
+    with pytest.raises(ValidationError):
+        Event(filename="file.csv", provider_source="s3")
 
-curl_with_retry \
-  "http://ap27920-data-pull-service:5004/v1/data_pull_service/new/transfer" \
-  "$(generate_post_data)" \
-  3 \
-  2 || {
-    echo "Transfer failed. Aborting." >&2
-    exit 1
-  }
+
+def test_all_fields_missing():
+    with pytest.raises(ValidationError):
+        Event()
+
+
+def test_invalid_type_filename():
+    with pytest.raises(ValidationError):
+        Event(filename=123, provider_source="s3", bucket_name="my-bucket")
+
+
+def test_empty_strings():
+    event = Event(filename="", provider_source="", bucket_name="")
+    assert event.filename == ""
+
+
+def test_serialization():
+    event = Event(
+        filename="data.json",
+        provider_source="gcs",
+        bucket_name="prod-bucket"
+    )
+    d = event.model_dump()
+    assert d == {
+        "filename": "data.json",
+        "provider_source": "gcs",
+        "bucket_name": "prod-bucket"
+    }

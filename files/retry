@@ -1,119 +1,144 @@
 import pytest
-from unittest.mock import MagicMock, patch, AsyncMock
-from fastapi.testclient import TestClient
-from fastapi import FastAPI
-from starlette import status
-
-from routes import router
-from base import RequestValidationError
+from unittest.mock import MagicMock, patch
+from authentication.skip_auth.exceptions import MissingTokenError
+from authentication.skip_auth.models import AuthContext, AuthMethod
+from authentication.skip_auth.service import AuthService
 
 
-# ── Setup ─────────────────────────────────────────────────────────────────────
+# ── Fixtures ──────────────────────────────────────────────────────────────────
 
-app = FastAPI()
-app.include_router(router)
-client = TestClient(app)
+VALID_AUTHORIZATION = "Bearer valid_token"
 
-VALID_DATA = {
-    "idf": "idf1",
-    "nidf": "nidf1",
-    "idt": "idt1",
-    "ida": "ida1",
-    "part": "part1",
-    "fname": "file.csv",
-    "parm": "parm1",
-    "fdate": "2026-01-01",
-    "ftime": "12:00:00",
-    "cftname": "cft1",
-    "workingdir": "/tmp",
-    "bucket_name": "my-bucket"
-}
+MOCK_SECURITY_SCOPES = MagicMock()
+MOCK_TOKEN_DETAIL = MagicMock()
 
 
-# ── new_transfer ──────────────────────────────────────────────────────────────
+# ── authenticate_internal ─────────────────────────────────────────────────────
 
-def test_new_transfer_valid_returns_204():
-    with patch("routes.PlatformFactory") as MockFactory:
-        mock_platform = MagicMock()
-        MockFactory.return_value.return_value = mock_platform
-
-        response = client.post(
-            "/new/transfer/CFT",
-            json=VALID_DATA
-        )
-        assert response.status_code == status.HTTP_204_NO_CONTENT
+def test_authenticate_internal_returns_auth_context():
+    result = AuthService.authenticate_internal()
+    assert isinstance(result, AuthContext)
 
 
-def test_new_transfer_calls_platform_factory_with_platform_name():
-    with patch("routes.PlatformFactory") as MockFactory:
-        mock_platform = MagicMock()
-        MockFactory.return_value.return_value = mock_platform
-
-        client.post("/new/transfer/CFT", json=VALID_DATA)
-
-        MockFactory.assert_called_once_with(platform_name="CFT")
+def test_authenticate_internal_user_is_internal():
+    result = AuthService.authenticate_internal()
+    assert result.user == "internal"
 
 
-def test_new_transfer_calls_send_kafka_message():
-    with patch("routes.PlatformFactory") as MockFactory:
-        mock_platform = MagicMock()
-        MockFactory.return_value.return_value = mock_platform
+def test_authenticate_internal_method_is_trusted_host():
+    result = AuthService.authenticate_internal()
+    assert result.method == AuthMethod.TRUSTED_HOST
 
-        client.post("/new/transfer/CFT", json=VALID_DATA)
 
-        mock_platform.send_kafka_message.assert_called_once_with(
-            producer_settings=pytest.ANY
+# ── authenticate_oauth2 ───────────────────────────────────────────────────────
+
+def test_authenticate_oauth2_none_authorization_raises_missing_token_error():
+    service = AuthService()
+    with pytest.raises(MissingTokenError):
+        service.authenticate_oauth2(
+            security_scopes=MOCK_SECURITY_SCOPES,
+            authorization=None
         )
 
 
-def test_new_transfer_invalid_platform_returns_422():
-    response = client.post(
-        "/new/transfer/INVALID_PLATFORM",
-        json=VALID_DATA
-    )
-    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+def test_authenticate_oauth2_returns_auth_context():
+    service = AuthService()
+    with patch.object(AuthService, "_verify_token", return_value=MOCK_TOKEN_DETAIL):
+        result = service.authenticate_oauth2(
+            security_scopes=MOCK_SECURITY_SCOPES,
+            authorization=VALID_AUTHORIZATION
+        )
+        assert isinstance(result, AuthContext)
 
 
-def test_new_transfer_empty_body_returns_422():
-    response = client.post(
-        "/new/transfer/CFT",
-        json={}
-    )
-    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+def test_authenticate_oauth2_user_is_authenticated():
+    service = AuthService()
+    with patch.object(AuthService, "_verify_token", return_value=MOCK_TOKEN_DETAIL):
+        result = service.authenticate_oauth2(
+            security_scopes=MOCK_SECURITY_SCOPES,
+            authorization=VALID_AUTHORIZATION
+        )
+        assert result.user == "authenticated"
 
 
-def test_new_transfer_request_validation_error_returns_400():
-    with patch("routes.PlatformFactory") as MockFactory:
-        MockFactory.return_value.side_effect = RequestValidationError([
-            {"msg": "field required", "loc": ["fname"]}
-        ])
-
-        response = client.post("/new/transfer/CFT", json=VALID_DATA)
-
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
-
-
-def test_new_transfer_logs_platform_name():
-    with patch("routes.PlatformFactory") as MockFactory, \
-         patch("routes.logger") as mock_logger:
-        mock_platform = MagicMock()
-        MockFactory.return_value.return_value = mock_platform
-
-        client.post("/new/transfer/CFT", json=VALID_DATA)
-
-        mock_logger.info.assert_called_once()
-        call_args = mock_logger.info.call_args
-        assert "CFT" in call_args[0][0]
+def test_authenticate_oauth2_method_is_oauth2():
+    service = AuthService()
+    with patch.object(AuthService, "_verify_token", return_value=MOCK_TOKEN_DETAIL):
+        result = service.authenticate_oauth2(
+            security_scopes=MOCK_SECURITY_SCOPES,
+            authorization=VALID_AUTHORIZATION
+        )
+        assert result.method == AuthMethod.OAUTH2
 
 
-def test_new_transfer_logger_extra_contains_transfer_and_auth():
-    with patch("routes.PlatformFactory") as MockFactory, \
-         patch("routes.logger") as mock_logger:
-        mock_platform = MagicMock()
-        MockFactory.return_value.return_value = mock_platform
+def test_authenticate_oauth2_token_from_verify_token():
+    service = AuthService()
+    with patch.object(AuthService, "_verify_token", return_value=MOCK_TOKEN_DETAIL):
+        result = service.authenticate_oauth2(
+            security_scopes=MOCK_SECURITY_SCOPES,
+            authorization=VALID_AUTHORIZATION
+        )
+        assert result.token == MOCK_TOKEN_DETAIL
 
-        client.post("/new/transfer/CFT", json=VALID_DATA)
 
-        call_kwargs = mock_logger.info.call_args.kwargs
-        assert "transfer" in call_kwargs["extra"]
-        assert "auth" in call_kwargs["extra"]
+def test_authenticate_oauth2_calls_verify_token_with_correct_args():
+    service = AuthService()
+    with patch.object(AuthService, "_verify_token", return_value=MOCK_TOKEN_DETAIL) as mock_verify:
+        service.authenticate_oauth2(
+            security_scopes=MOCK_SECURITY_SCOPES,
+            authorization=VALID_AUTHORIZATION,
+            check_audience=False
+        )
+        mock_verify.assert_called_once_with(
+            authorization=VALID_AUTHORIZATION,
+            check_audience=False,
+            security_scopes=MOCK_SECURITY_SCOPES
+        )
+
+
+def test_authenticate_oauth2_check_audience_default_is_true():
+    service = AuthService()
+    with patch.object(AuthService, "_verify_token", return_value=MOCK_TOKEN_DETAIL) as mock_verify:
+        service.authenticate_oauth2(
+            security_scopes=MOCK_SECURITY_SCOPES,
+            authorization=VALID_AUTHORIZATION
+        )
+        call_kwargs = mock_verify.call_args.kwargs
+        assert call_kwargs["check_audience"] is True
+
+
+# ── _verify_token ─────────────────────────────────────────────────────────────
+
+def test_verify_token_calls_get_token_details():
+    with patch("authentication.skip_auth.service.get_token_details") as mock_details, \
+         patch("authentication.skip_auth.service.get_token_by_claim", return_value=MOCK_TOKEN_DETAIL):
+        mock_claims = MagicMock()
+        mock_details.return_value = mock_claims
+
+        result = AuthService._verify_token(
+            security_scopes=MOCK_SECURITY_SCOPES,
+            authorization=VALID_AUTHORIZATION,
+            check_audience=True
+        )
+
+        mock_details.assert_called_once_with(
+            MOCK_SECURITY_SCOPES,
+            VALID_AUTHORIZATION,
+            True
+        )
+
+
+def test_verify_token_calls_get_token_by_claim():
+    with patch("authentication.skip_auth.service.get_token_details") as mock_details, \
+         patch("authentication.skip_auth.service.get_token_by_claim", return_value=MOCK_TOKEN_DETAIL) as mock_claim:
+        mock_claims = MagicMock()
+        mock_details.return_value = mock_claims
+
+        result = AuthService._verify_token(
+            security_scopes=MOCK_SECURITY_SCOPES,
+            authorization=VALID_AUTHORIZATION,
+            check_audience=True
+        )
+
+        mock_claim.assert_called_once_with(claims=mock_claims)
+        assert result == MOCK_TOKEN_DETAIL

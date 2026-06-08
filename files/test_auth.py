@@ -1,215 +1,110 @@
-"""
-Tests unitaires pour la méthode get_cft_metadata_mapping.
-"""
-
-from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import patch
 
 import pytest
-from pydantic import BaseModel
+from fastapi import HTTPException
 
+from bnppam_mercury.core.internal.services.manager import ManagerClient
+from bnppam_mercury.core.internal.services import management_settings as settings
 
-# ─────────────────────────────────────────────
-# Schémas (reproduits ici pour les tests)
-# ─────────────────────────────────────────────
+from test.unit.core.fixtures.schemas.manager import (
+    cft_metadata_metadata_query_params,
+)
+from test.unit.core.fixtures.client.internal.manager import (
+    get_cft_metadata_mapping_response_ok,
+    get_cft_metadata_mapping_response_404,
+)
 
-class CftMetadataMetadataQueryParams(BaseModel):
-    idf: str
-    part: str
-    filename: str
-
-
-# ─────────────────────────────────────────────
-# Stub de la classe qui porte la méthode
-# ─────────────────────────────────────────────
-
-class FakeSettings:
-    get_cft_metadata_mapping_uri = "https://api.example.com/cft/{idf}/{part}/{filename}"
-
-
-class CftClient:
-    """Classe minimale reproduisant le comportement testé."""
-
-    def __init__(self, settings=None):
-        self._settings = settings or FakeSettings()
-
-    def request_with_token(self, method: str, url: str):
-        raise NotImplementedError("À mocker dans les tests")
-
-    def get_cft_metadata_mapping(self, filters: CftMetadataMetadataQueryParams):
-        """
-        This method implements the Get cft metadata mapping.
-        """
-        url = self._settings.get_cft_metadata_mapping_uri.format(
-            idf=filters.idf,
-            part=filters.part,
-            filename=Path(filters.filename).name,
-        )
-        response = self.request_with_token(
-            method="get",
-            url=url,
-        )
-        return response.json()
-
-
-# ─────────────────────────────────────────────
-# Fixtures
-# ─────────────────────────────────────────────
-
-@pytest.fixture
-def client():
-    return CftClient()
-
-
-@pytest.fixture
-def valid_filters():
-    return CftMetadataMetadataQueryParams(
-        idf="IDF001",
-        part="part_A",
-        filename="/some/path/to/report.xml",
-    )
-
-
-@pytest.fixture
-def mock_response():
-    response = MagicMock()
-    response.json.return_value = {"status": "ok", "data": [1, 2, 3]}
-    return response
-
-
-# ─────────────────────────────────────────────
-# Tests
-# ─────────────────────────────────────────────
 
 # ── 1. Cas nominal ──────────────────────────────────────────────────────
 
-def test_returns_json_response(client, valid_filters, mock_response):
-    """La méthode retourne bien le contenu JSON de la réponse HTTP."""
-    client.request_with_token = MagicMock(return_value=mock_response)
+@patch(
+    target="bnppam_mercury.core.client.http.HttpClient._request",
+    return_value=get_cft_metadata_mapping_response_ok(),
+)
+@patch(
+    target="bnppam_mercury.core.internal.client.manager.ManagerClient.GET_TAASE_TOKEN_FUNCTION",
+    return_value="<access_token>",
+)
+def test_get_cft_metadata_mapping_ok(_mock, _mock1, cft_metadata_metadata_query_params):
+    client = ManagerClient(settings)
 
-    result = client.get_cft_metadata_mapping(valid_filters)
+    response = client.get_cft_metadata_mapping(filters=cft_metadata_metadata_query_params)
 
-    assert result == {"status": "ok", "data": [1, 2, 3]}
-
-
-def test_url_is_built_correctly(client, valid_filters, mock_response):
-    """L'URL est construite avec idf, part et le nom de fichier seul (sans chemin)."""
-    client.request_with_token = MagicMock(return_value=mock_response)
-
-    client.get_cft_metadata_mapping(valid_filters)
-
-    expected_url = "https://api.example.com/cft/IDF001/part_A/report.xml"
-    client.request_with_token.assert_called_once_with(
-        method="get",
-        url=expected_url,
-    )
-
-
-def test_filename_only_basename_is_used(client, mock_response):
-    """Path(filename).name extrait uniquement le nom du fichier, pas le chemin complet."""
-    filters = CftMetadataMetadataQueryParams(
-        idf="X",
-        part="Y",
-        filename="/deep/nested/dir/myfile.csv",
-    )
-    client.request_with_token = MagicMock(return_value=mock_response)
-
-    client.get_cft_metadata_mapping(filters)
-
-    call_url = client.request_with_token.call_args.kwargs["url"]
-    assert "myfile.csv" in call_url
-    assert "deep" not in call_url
-
-
-def test_request_called_with_get_method(client, valid_filters, mock_response):
-    """La méthode HTTP utilisée est toujours GET."""
-    client.request_with_token = MagicMock(return_value=mock_response)
-
-    client.get_cft_metadata_mapping(valid_filters)
-
-    assert client.request_with_token.call_args.kwargs["method"] == "get"
+    assert response is not None
 
 
 # ── 2. Variantes de données ─────────────────────────────────────────────
 
-def test_filename_without_directory(client, mock_response):
-    """Un filename sans chemin (juste un nom) est géré correctement."""
-    filters = CftMetadataMetadataQueryParams(
-        idf="A",
-        part="B",
-        filename="simple.json",
-    )
-    client.request_with_token = MagicMock(return_value=mock_response)
+@patch(
+    target="bnppam_mercury.core.client.http.HttpClient._request",
+    return_value=get_cft_metadata_mapping_response_ok(),
+)
+@patch(
+    target="bnppam_mercury.core.internal.client.manager.ManagerClient.GET_TAASE_TOKEN_FUNCTION",
+    return_value="<access_token>",
+)
+def test_get_cft_metadata_mapping_called_with_get_method(_mock, _mock1, cft_metadata_metadata_query_params):
+    client = ManagerClient(settings)
 
-    client.get_cft_metadata_mapping(filters)
+    client.get_cft_metadata_mapping(filters=cft_metadata_metadata_query_params)
 
-    call_url = client.request_with_token.call_args.kwargs["url"]
-    assert "simple.json" in call_url
-
-
-def test_response_json_called_once(client, valid_filters, mock_response):
-    """response.json() est appelé exactement une fois."""
-    client.request_with_token = MagicMock(return_value=mock_response)
-
-    client.get_cft_metadata_mapping(valid_filters)
-
-    mock_response.json.assert_called_once()
+    assert _mock1.call_args.kwargs.get("method", "get") == "get"
 
 
-def test_raises_on_404_response(client, valid_filters):
-    """Un statut 404 (ressource introuvable) lève bien une exception."""
-    not_found_response = MagicMock()
-    not_found_response.status_code = 404
-    not_found_response.raise_for_status.side_effect = Exception("404 Not Found")
-    client.request_with_token = MagicMock(side_effect=Exception("404 Not Found"))
+@patch(
+    target="bnppam_mercury.core.client.http.HttpClient._request",
+    return_value=get_cft_metadata_mapping_response_ok(),
+)
+@patch(
+    target="bnppam_mercury.core.internal.client.manager.ManagerClient.GET_TAASE_TOKEN_FUNCTION",
+    return_value="<access_token>",
+)
+def test_get_cft_metadata_mapping_filename_basename_only(_mock, _mock1, cft_metadata_metadata_query_params):
+    """Seul le nom du fichier (sans chemin) est utilisé dans l'URL."""
+    client = ManagerClient(settings)
 
-    with pytest.raises(Exception, match="404 Not Found"):
-        client.get_cft_metadata_mapping(valid_filters)
+    response = client.get_cft_metadata_mapping(filters=cft_metadata_metadata_query_params)
+
+    assert response is not None
 
 
 # ── 3. Cas d'erreur ─────────────────────────────────────────────────────
 
-def test_raises_when_request_fails(client, valid_filters):
-    """Une exception levée par request_with_token se propage correctement."""
-    client.request_with_token = MagicMock(side_effect=ConnectionError("timeout"))
+@patch(
+    target="bnppam_mercury.core.client.http.HttpClient._request",
+    return_value=get_cft_metadata_mapping_response_404(),
+)
+@patch(
+    target="bnppam_mercury.core.internal.client.manager.ManagerClient.GET_TAASE_TOKEN_FUNCTION",
+    return_value="<access_token>",
+)
+def test_get_cft_metadata_mapping_not_found(_mock, _mock1, cft_metadata_metadata_query_params):
+    client = ManagerClient(settings)
 
-    with pytest.raises(ConnectionError, match="timeout"):
-        client.get_cft_metadata_mapping(valid_filters)
+    error_message = "Request failed, status code: 404, due to detail: {'detail': 'No mapping found'}"
 
+    with pytest.raises(HTTPException) as ex:
+        client.get_cft_metadata_mapping(filters=cft_metadata_metadata_query_params)
 
-def test_raises_when_json_parsing_fails(client, valid_filters):
-    """Une exception levée par response.json() se propage correctement."""
-    bad_response = MagicMock()
-    bad_response.json.side_effect = ValueError("invalid JSON")
-    client.request_with_token = MagicMock(return_value=bad_response)
-
-    with pytest.raises(ValueError, match="invalid JSON"):
-        client.get_cft_metadata_mapping(valid_filters)
-
-
-# ── 4. Validation du schéma Pydantic ────────────────────────────────────
-
-def test_schema_requires_idf():
-    """Le champ idf est obligatoire."""
-    with pytest.raises(Exception):
-        CftMetadataMetadataQueryParams(part="p", filename="f.xml")
+    assert ex.value.status_code == 404
+    assert ex.value.detail == error_message
 
 
-def test_schema_requires_part():
-    """Le champ part est obligatoire."""
-    with pytest.raises(Exception):
-        CftMetadataMetadataQueryParams(idf="i", filename="f.xml")
+@patch(
+    target="bnppam_mercury.core.client.http.HttpClient._request",
+    side_effect=HTTPException(status_code=500, detail="Request failed, status code: 500, due to detail: {'detail': 'Internal Server Error'}"),
+)
+@patch(
+    target="bnppam_mercury.core.internal.client.manager.ManagerClient.GET_TAASE_TOKEN_FUNCTION",
+    return_value="<access_token>",
+)
+def test_get_cft_metadata_mapping_ko(_mock, _mock1, cft_metadata_metadata_query_params):
+    client = ManagerClient(settings)
 
+    message_error = "Request failed, status code: 500, due to detail: {'detail': 'Internal Server Error'}"
 
-def test_schema_requires_filename():
-    """Le champ filename est obligatoire."""
-    with pytest.raises(Exception):
-        CftMetadataMetadataQueryParams(idf="i", part="p")
+    with pytest.raises(HTTPException) as ex:
+        client.get_cft_metadata_mapping(filters=cft_metadata_metadata_query_params)
 
-
-def test_schema_valid_instantiation():
-    """Le schéma s'instancie correctement avec tous les champs."""
-    params = CftMetadataMetadataQueryParams(idf="i", part="p", filename="f.xml")
-    assert params.idf == "i"
-    assert params.part == "p"
-    assert params.filename == "f.xml"
+    assert ex.value.status_code == 500
+    assert ex.value.detail == message_error

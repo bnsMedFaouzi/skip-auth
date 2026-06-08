@@ -21,7 +21,11 @@ from test.unit.core.fixtures.client.internal.manager import (
     target="bnppam_mercury.core.client.http.HttpClient.request_with_token",
     return_value=get_cft_metadata_mapping_response_ok(),
 )
-def test_get_cft_metadata_mapping_ok(_mock, cft_metadata_metadata_query_params):
+@patch(
+    target="bnppam_mercury.core.internal.client.manager.ManagerClient.GET_TAASE_TOKEN_FUNCTION",
+    return_value="<access_token>",
+)
+def test_get_cft_metadata_mapping_ok(_mock, _mock1, cft_metadata_metadata_query_params):
     service = ManagerServices(settings)
 
     response = service.get_cft_metadata_mapping(
@@ -48,7 +52,11 @@ def test_get_cft_metadata_mapping_ok(_mock, cft_metadata_metadata_query_params):
     target="bnppam_mercury.core.client.http.HttpClient.request_with_token",
     return_value=get_cft_metadata_mapping_response_ok(),
 )
-def test_get_cft_metadata_mapping_pivot_business_scope_default(_mock, cft_metadata_metadata_query_params):
+@patch(
+    target="bnppam_mercury.core.internal.client.manager.ManagerClient.GET_TAASE_TOKEN_FUNCTION",
+    return_value="<access_token>",
+)
+def test_get_cft_metadata_mapping_pivot_business_scope_default(_mock, _mock1, cft_metadata_metadata_query_params):
     """business_scope vaut '' par défaut si absent."""
     service = ManagerServices(settings)
 
@@ -68,7 +76,11 @@ def test_get_cft_metadata_mapping_pivot_business_scope_default(_mock, cft_metada
     target="bnppam_mercury.core.client.http.HttpClient.request_with_token",
     side_effect=HTTPException(status_code=500, detail="Internal Server Error"),
 )
-def test_get_cft_metadata_mapping_ko(_mock, cft_metadata_metadata_query_params):
+@patch(
+    target="bnppam_mercury.core.internal.client.manager.ManagerClient.GET_TAASE_TOKEN_FUNCTION",
+    return_value="<access_token>",
+)
+def test_get_cft_metadata_mapping_ko(_mock, _mock1, cft_metadata_metadata_query_params):
     service = ManagerServices(settings)
 
     with pytest.raises(HTTPException) as ex:
@@ -86,7 +98,11 @@ def test_get_cft_metadata_mapping_ko(_mock, cft_metadata_metadata_query_params):
     target="bnppam_mercury.core.client.http.HttpClient.request_with_token",
     side_effect=HTTPException(status_code=404, detail="No mapping found"),
 )
-def test_get_cft_metadata_mapping_not_found(_mock, cft_metadata_metadata_query_params):
+@patch(
+    target="bnppam_mercury.core.internal.client.manager.ManagerClient.GET_TAASE_TOKEN_FUNCTION",
+    return_value="<access_token>",
+)
+def test_get_cft_metadata_mapping_not_found(_mock, _mock1, cft_metadata_metadata_query_params):
     service = ManagerServices(settings)
 
     with pytest.raises(HTTPException) as ex:

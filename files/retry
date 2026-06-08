@@ -1,3 +1,7 @@
+import json
+from httpx import Response
+
+
 def get_cft_metadata_mapping_response_ok() -> Response:
     success_response = Response()
     success_response.status_code = 200
@@ -24,8 +28,8 @@ def get_cft_metadata_mapping_response_ok() -> Response:
         },
     }).encode("utf-8")
     return success_response
- 
- 
+
+
 def get_cft_metadata_mapping_response_404() -> Response:
     _404_response = Response()
     _404_response.status_code = 404

@@ -1,220 +1,229 @@
 import pytest
-from unittest.mock import MagicMock, patch, call
-from fastapi import HTTPException
-from pydantic import BaseModel
+from unittest.mock import MagicMock, patch
 
-from tests.fixtures.interface_fixtures import (
-    mock_client,
-    mock_client_settings_class,
-    mock_client_class,
-    mock_file_info,
-    mock_files_info,
-    http_exception_rejected,
-    http_exception_retryable,
-    http_exception_unknown,
-    interface,
+from tests.fixtures.file_manager_fixtures import (
+    mock_src_cos_settings,
+    mock_dest_cos_settings,
+    mock_src_cos_settings_class,
+    mock_dest_cos_settings_class,
+    mock_service_instance,
+    mock_service_class,
+    mock_publication,
+    file_manager,
 )
 
 
 # ===========================================================================
-# __init__ — client initialization
+# __init__
 # ===========================================================================
 
-def test_init_creates_client_with_settings(mock_client_settings_class, mock_client_class):
-    from data_push_cft.output_platform.base.interface import BasePlatformInterface
+def test_init_sets_src_cos_from_settings(
+    mock_src_cos_settings_class, mock_dest_cos_settings_class, mock_service_class
+):
+    from data_push_cft.output_platform.base.file_manager import BaseFileManager
 
-    handler = BasePlatformInterface.__new__(BasePlatformInterface)
+    handler = BaseFileManager.__new__(BaseFileManager)
 
     def fake_get_class_type(attr_name):
         return {
-            "PLATFORM_CLIENT_SETTINGS_CLASS": mock_client_settings_class,
+            "SRC_COS_SETTINGS_CLASS": mock_src_cos_settings_class,
+            "DEST_COS_SETTINGS_CLASS": mock_dest_cos_settings_class,
         }.get(attr_name)
 
     with patch.object(handler, "_get_class_type", side_effect=fake_get_class_type), \
-         patch.object(handler, "_get_client_class", return_value=mock_client_class):
+         patch.object(handler, "_get_service_class", return_value=mock_service_class):
         handler.__init__()
 
-    mock_client_settings_class.assert_called_once()
-    mock_client_class.assert_called_once_with(settings=mock_client_settings_class.return_value)
+    assert handler._src_cos == mock_src_cos_settings_class.return_value.COS_NAME
 
 
-def test_init_sets_client_instance(mock_client_settings_class, mock_client_class):
-    from data_push_cft.output_platform.base.interface import BasePlatformInterface
+def test_init_sets_dest_cos_from_settings(
+    mock_src_cos_settings_class, mock_dest_cos_settings_class, mock_service_class
+):
+    from data_push_cft.output_platform.base.file_manager import BaseFileManager
 
-    handler = BasePlatformInterface.__new__(BasePlatformInterface)
+    handler = BaseFileManager.__new__(BaseFileManager)
 
     def fake_get_class_type(attr_name):
         return {
-            "PLATFORM_CLIENT_SETTINGS_CLASS": mock_client_settings_class,
+            "SRC_COS_SETTINGS_CLASS": mock_src_cos_settings_class,
+            "DEST_COS_SETTINGS_CLASS": mock_dest_cos_settings_class,
         }.get(attr_name)
 
     with patch.object(handler, "_get_class_type", side_effect=fake_get_class_type), \
-         patch.object(handler, "_get_client_class", return_value=mock_client_class):
+         patch.object(handler, "_get_service_class", return_value=mock_service_class):
         handler.__init__()
 
-    assert handler._client is mock_client_class.return_value
+    assert handler._dest_cos == mock_dest_cos_settings_class.return_value.COS_NAME
 
 
-# ===========================================================================
-# client property
-# ===========================================================================
-
-def test_client_property_returns_client(interface, mock_client):
-    assert interface.client is mock_client
-
-
-# ===========================================================================
-# push_files
-# ===========================================================================
-
-def test_push_files_returns_list(interface, mock_files_info):
-    with patch.object(interface, "_push_file", return_value=MagicMock(spec=BaseModel)):
-        result = interface.push_files(mock_files_info)
-    assert isinstance(result, list)
-
-
-def test_push_files_returns_one_result_per_file(interface, mock_files_info):
-    with patch.object(interface, "_push_file", return_value=MagicMock(spec=BaseModel)):
-        result = interface.push_files(mock_files_info)
-    assert len(result) == len(mock_files_info)
-
-
-def test_push_files_calls_push_file_for_each_file(interface, mock_files_info):
-    with patch.object(interface, "_push_file", return_value=MagicMock()) as mock_push:
-        interface.push_files(mock_files_info)
-    assert mock_push.call_count == len(mock_files_info)
-
-
-def test_push_files_passes_kwargs_to_push_file(interface, mock_files_info):
-    with patch.object(interface, "_push_file", return_value=MagicMock()) as mock_push:
-        interface.push_files(mock_files_info, bucket="my-bucket", prefix="data/")
-    for c in mock_push.call_args_list:
-        assert c.kwargs.get("bucket") == "my-bucket"
-        assert c.kwargs.get("prefix") == "data/"
-
-
-def test_push_files_calls_resolve_action_on_http_exception(
-    interface, mock_files_info, http_exception_rejected
+def test_init_creates_service_with_cos_settings(
+    mock_src_cos_settings_class, mock_dest_cos_settings_class, mock_service_class
 ):
-    with patch.object(interface, "_push_file", side_effect=http_exception_rejected), \
-         patch.object(interface, "_resolve_action") as mock_resolve:
-        interface.push_files(mock_files_info)
-    mock_resolve.assert_called_once_with(http_exception_rejected)
+    from data_push_cft.output_platform.base.file_manager import BaseFileManager
+
+    handler = BaseFileManager.__new__(BaseFileManager)
+
+    def fake_get_class_type(attr_name):
+        return {
+            "SRC_COS_SETTINGS_CLASS": mock_src_cos_settings_class,
+            "DEST_COS_SETTINGS_CLASS": mock_dest_cos_settings_class,
+        }.get(attr_name)
+
+    with patch.object(handler, "_get_class_type", side_effect=fake_get_class_type), \
+         patch.object(handler, "_get_service_class", return_value=mock_service_class):
+        handler.__init__()
+
+    mock_service_class.assert_called_once_with(
+        cos_settings=[
+            mock_src_cos_settings_class.return_value,
+            mock_dest_cos_settings_class.return_value,
+        ]
+    )
 
 
-def test_push_files_with_empty_list_returns_empty_list(interface):
-    result = interface.push_files([])
-    assert result == []
-
-
-# ===========================================================================
-# check_liveness
-# ===========================================================================
-
-def test_check_liveness_calls_health_check(interface, mock_client):
-    interface.check_liveness()
-    mock_client.health_check.assert_called_once()
-
-
-def test_check_liveness_calls_resolve_action_on_http_exception(
-    interface, mock_client, http_exception_retryable
+def test_init_sets_file_manager_instance(
+    mock_src_cos_settings_class, mock_dest_cos_settings_class, mock_service_class
 ):
-    mock_client.health_check.side_effect = http_exception_retryable
-    with patch.object(interface, "_resolve_action") as mock_resolve:
-        interface.check_liveness()
-    mock_resolve.assert_called_once_with(http_exception_retryable)
+    from data_push_cft.output_platform.base.file_manager import BaseFileManager
+
+    handler = BaseFileManager.__new__(BaseFileManager)
+
+    def fake_get_class_type(attr_name):
+        return {
+            "SRC_COS_SETTINGS_CLASS": mock_src_cos_settings_class,
+            "DEST_COS_SETTINGS_CLASS": mock_dest_cos_settings_class,
+        }.get(attr_name)
+
+    with patch.object(handler, "_get_class_type", side_effect=fake_get_class_type), \
+         patch.object(handler, "_get_service_class", return_value=mock_service_class):
+        handler.__init__()
+
+    assert handler._file_manager is mock_service_class.return_value
 
 
 # ===========================================================================
-# _resolve_action
+# services property
 # ===========================================================================
 
-def test_resolve_action_raises_rejected_exception_for_4xx(
-    interface, http_exception_rejected
+def test_services_property_returns_file_manager(file_manager, mock_service_instance):
+    assert file_manager.services is mock_service_instance
+
+
+# ===========================================================================
+# upload_files — abstract stub
+# ===========================================================================
+
+def test_upload_files_is_callable(file_manager):
+    assert callable(file_manager.upload_files)
+
+
+def test_upload_files_returns_none_when_not_implemented(file_manager, mock_publication):
+    result = file_manager.upload_files(publication=mock_publication)
+    assert result is None
+
+
+def test_upload_files_accepts_prefix_argument(file_manager, mock_publication):
+    result = file_manager.upload_files(publication=mock_publication, prefix="2024/01")
+    assert result is None
+
+
+def test_upload_files_prefix_defaults_to_none(file_manager, mock_publication):
+    # Should not raise when prefix is omitted
+    file_manager.upload_files(publication=mock_publication)
+
+
+# ===========================================================================
+# __init_cos_settings__
+# ===========================================================================
+
+def test_init_cos_settings_returns_tuple_of_two(file_manager, mock_src_cos_settings_class, mock_dest_cos_settings_class):
+    def fake_get_class_type(attr_name):
+        return {
+            "SRC_COS_SETTINGS_CLASS": mock_src_cos_settings_class,
+            "DEST_COS_SETTINGS_CLASS": mock_dest_cos_settings_class,
+        }.get(attr_name)
+
+    with patch.object(file_manager, "_get_class_type", side_effect=fake_get_class_type):
+        result = file_manager.__init_cos_settings__()
+
+    assert isinstance(result, tuple)
+    assert len(result) == 2
+
+
+def test_init_cos_settings_returns_src_settings_instance(
+    file_manager, mock_src_cos_settings_class, mock_dest_cos_settings_class
 ):
-    from data_push_cft.output_platform.exceptiones import RejectedException
-    with pytest.raises(RejectedException):
-        interface._resolve_action(http_exception_rejected)
+    def fake_get_class_type(attr_name):
+        return {
+            "SRC_COS_SETTINGS_CLASS": mock_src_cos_settings_class,
+            "DEST_COS_SETTINGS_CLASS": mock_dest_cos_settings_class,
+        }.get(attr_name)
+
+    with patch.object(file_manager, "_get_class_type", side_effect=fake_get_class_type):
+        src, _ = file_manager.__init_cos_settings__()
+
+    assert src is mock_src_cos_settings_class.return_value
 
 
-def test_resolve_action_raises_retryable_exception_for_5xx(
-    interface, http_exception_retryable
+def test_init_cos_settings_returns_dest_settings_instance(
+    file_manager, mock_src_cos_settings_class, mock_dest_cos_settings_class
 ):
-    from data_push_cft.output_platform.exceptiones import RetryableException
-    with pytest.raises(RetryableException):
-        interface._resolve_action(http_exception_retryable)
+    def fake_get_class_type(attr_name):
+        return {
+            "SRC_COS_SETTINGS_CLASS": mock_src_cos_settings_class,
+            "DEST_COS_SETTINGS_CLASS": mock_dest_cos_settings_class,
+        }.get(attr_name)
+
+    with patch.object(file_manager, "_get_class_type", side_effect=fake_get_class_type):
+        _, dest = file_manager.__init_cos_settings__()
+
+    assert dest is mock_dest_cos_settings_class.return_value
 
 
-def test_resolve_action_does_not_raise_for_unknown_status(
-    interface, http_exception_unknown
+def test_init_cos_settings_instantiates_src_class(
+    file_manager, mock_src_cos_settings_class, mock_dest_cos_settings_class
 ):
-    # 3xx — neither rejected nor retryable → no exception
-    interface._resolve_action(http_exception_unknown)
+    def fake_get_class_type(attr_name):
+        return {
+            "SRC_COS_SETTINGS_CLASS": mock_src_cos_settings_class,
+            "DEST_COS_SETTINGS_CLASS": mock_dest_cos_settings_class,
+        }.get(attr_name)
+
+    with patch.object(file_manager, "_get_class_type", side_effect=fake_get_class_type):
+        file_manager.__init_cos_settings__()
+
+    mock_src_cos_settings_class.assert_called_once()
 
 
-def test_resolve_action_rejected_status_boundary_400(interface):
-    from data_push_cft.output_platform.exceptiones import RejectedException
-    e = HTTPException(status_code=400)
-    with pytest.raises(RejectedException):
-        interface._resolve_action(e)
+def test_init_cos_settings_instantiates_dest_class(
+    file_manager, mock_src_cos_settings_class, mock_dest_cos_settings_class
+):
+    def fake_get_class_type(attr_name):
+        return {
+            "SRC_COS_SETTINGS_CLASS": mock_src_cos_settings_class,
+            "DEST_COS_SETTINGS_CLASS": mock_dest_cos_settings_class,
+        }.get(attr_name)
 
+    with patch.object(file_manager, "_get_class_type", side_effect=fake_get_class_type):
+        file_manager.__init_cos_settings__()
 
-def test_resolve_action_rejected_status_boundary_499(interface):
-    from data_push_cft.output_platform.exceptiones import RejectedException
-    e = HTTPException(status_code=499)
-    with pytest.raises(RejectedException):
-        interface._resolve_action(e)
-
-
-def test_resolve_action_retryable_status_boundary_500(interface):
-    from data_push_cft.output_platform.exceptiones import RetryableException
-    e = HTTPException(status_code=500)
-    with pytest.raises(RetryableException):
-        interface._resolve_action(e)
-
-
-def test_resolve_action_retryable_status_boundary_599(interface):
-    from data_push_cft.output_platform.exceptiones import RetryableException
-    e = HTTPException(status_code=599)
-    with pytest.raises(RetryableException):
-        interface._resolve_action(e)
+    mock_dest_cos_settings_class.assert_called_once()
 
 
 # ===========================================================================
-# _get_client_class
+# _get_service_class
 # ===========================================================================
 
-def test_get_client_class_delegates_to_get_class_type(interface):
-    mock_class = MagicMock()
-    with patch.object(interface, "_get_class_type", return_value=mock_class) as mock_get:
-        result = interface._get_client_class()
-    mock_get.assert_called_once_with("PLATFORM_CLIENT_CLASS")
-    assert result is mock_class
+def test_get_service_class_delegates_to_get_class_type(file_manager):
+    mock_cls = MagicMock()
+    with patch.object(file_manager, "_get_class_type", return_value=mock_cls) as mock_get:
+        result = file_manager._get_service_class()
+    mock_get.assert_called_once_with("File_MANAGAER_SERVICES_CLASS")
+    assert result is mock_cls
 
 
-# ===========================================================================
-# _push_file
-# ===========================================================================
-
-def test_push_file_calls_client_transfer_file(interface, mock_client, mock_file_info):
-    interface._push_file(mock_file_info)
-    mock_client.transfer_file.assert_called_once()
-
-
-def test_push_file_passes_file_info_to_transfer_file(interface, mock_client, mock_file_info):
-    interface._push_file(mock_file_info)
-    call_args = mock_client.transfer_file.call_args
-    assert mock_file_info in call_args.args or mock_file_info in call_args.kwargs.values()
-
-
-def test_push_file_passes_kwargs_to_transfer_file(interface, mock_client, mock_file_info):
-    interface._push_file(mock_file_info, bucket="test-bucket")
-    call_kwargs = mock_client.transfer_file.call_args.kwargs
-    assert call_kwargs.get("bucket") == "test-bucket"
-
-
-def test_push_file_returns_result_from_transfer_file(interface, mock_client, mock_file_info):
-    mock_result = MagicMock(spec=BaseModel)
-    mock_client.transfer_file.return_value = mock_result
-    result = interface._push_file(mock_file_info)
-    assert result is mock_result
+def test_get_service_class_returns_none_when_not_defined(file_manager):
+    with patch.object(file_manager, "_get_class_type", return_value=None):
+        result = file_manager._get_service_class()
+    assert result is None

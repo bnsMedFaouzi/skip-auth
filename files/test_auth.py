@@ -116,27 +116,20 @@ def test_get_creds_uses_settings_username(cft_client, mock_settings):
 def test_request_calls_correct_session_method():
     from data_push_cft.output_platform.cft.client import CftClient
     mock_session = MagicMock()
-    mock_session.get.return_value = MagicMock()
-
-    with patch("data_push_cft.output_platform.cft.client.logger"):
-        CftClient._request(session=mock_session, method="get", url="https://example.com")
-
+    CftClient._request(session=mock_session, method="get", url="https://example.com")
     mock_session.get.assert_called_once()
 
 
 def test_request_passes_url_and_params():
     from data_push_cft.output_platform.cft.client import CftClient
     mock_session = MagicMock()
-
-    with patch("data_push_cft.output_platform.cft.client.logger"):
-        CftClient._request(
-            session=mock_session,
-            method="post",
-            url="https://example.com",
-            params={"key": "val"},
-            data={"body": "data"}
-        )
-
+    CftClient._request(
+        session=mock_session,
+        method="post",
+        url="https://example.com",
+        params={"key": "val"},
+        data={"body": "data"}
+    )
     call_kwargs = mock_session.post.call_args.kwargs
     assert call_kwargs["url"] == "https://example.com"
     assert call_kwargs["params"] == {"key": "val"}
@@ -148,8 +141,5 @@ def test_request_returns_response():
     mock_session = MagicMock()
     mock_response = MagicMock()
     mock_session.get.return_value = mock_response
-
-    with patch("data_push_cft.output_platform.cft.client.logger"):
-        result = CftClient._request(session=mock_session, method="get", url="https://example.com")
-
+    result = CftClient._request(session=mock_session, method="get", url="https://example.com")
     assert result is mock_response

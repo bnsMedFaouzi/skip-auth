@@ -11,6 +11,7 @@ from tests.fixtures.cft_client_fixtures import (
 
 # ===========================================================================
 # transfer_file
+# Fix: patch TransferRequestPrams.model_validate to bypass CftFlow validation
 # ===========================================================================
 
 def test_transfer_file_calls_request_with_post(cft_client, mock_file_info):
@@ -18,7 +19,9 @@ def test_transfer_file_calls_request_with_post(cft_client, mock_file_info):
     mock_response.json.return_value = {"idtu": "T1", "ida": "A1", "idt": "D1"}
     cft_client.request_with_basic_auth = MagicMock(return_value=mock_response)
 
-    with patch.object(cft_client, "_get_creds", return_value=MagicMock(model_dump=lambda: {})):
+    with patch.object(cft_client, "_get_creds", return_value=MagicMock(model_dump=lambda: {})), \
+         patch("data_push_cft.output_platform.cft.client.TransferRequestPrams") as mock_prams:
+        mock_prams.model_validate.return_value.model_dump.return_value = {}
         cft_client.transfer_file(mock_file_info)
 
     call_kwargs = cft_client.request_with_basic_auth.call_args.kwargs
@@ -30,7 +33,9 @@ def test_transfer_file_uses_transfer_uri(cft_client, mock_file_info, mock_settin
     mock_response.json.return_value = {"idtu": "T1", "ida": "A1", "idt": "D1"}
     cft_client.request_with_basic_auth = MagicMock(return_value=mock_response)
 
-    with patch.object(cft_client, "_get_creds", return_value=MagicMock(model_dump=lambda: {})):
+    with patch.object(cft_client, "_get_creds", return_value=MagicMock(model_dump=lambda: {})), \
+         patch("data_push_cft.output_platform.cft.client.TransferRequestPrams") as mock_prams:
+        mock_prams.model_validate.return_value.model_dump.return_value = {}
         cft_client.transfer_file(mock_file_info)
 
     call_kwargs = cft_client.request_with_basic_auth.call_args.kwargs
@@ -43,7 +48,9 @@ def test_transfer_file_returns_transfer_request(cft_client, mock_file_info):
     mock_response.json.return_value = {"idtu": "T1", "ida": "A1", "idt": "D1"}
     cft_client.request_with_basic_auth = MagicMock(return_value=mock_response)
 
-    with patch.object(cft_client, "_get_creds", return_value=MagicMock(model_dump=lambda: {})):
+    with patch.object(cft_client, "_get_creds", return_value=MagicMock(model_dump=lambda: {})), \
+         patch("data_push_cft.output_platform.cft.client.TransferRequestPrams") as mock_prams:
+        mock_prams.model_validate.return_value.model_dump.return_value = {}
         result = cft_client.transfer_file(mock_file_info)
 
     assert isinstance(result, TransferRequest)

@@ -1,27 +1,36 @@
 import pytest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 @pytest.fixture
-def mock_argv_etl():
-    with patch("sys.argv", ["DATA-PUSH", "-p", "ETL"]):
-        yield
+def file_transfer_client():
+    """
+    Creates a concrete subclass of FileTransferClient to test
+    the abstract methods without instantiating HttpClient directly.
+    """
+    with patch("data_push_cft.client.file_transfer.HttpClient.__init__", return_value=None):
+        from data_push_cft.client.file_transfer import FileTransferClient
+        client = FileTransferClient.__new__(FileTransferClient)
+        yield client
 
 
 @pytest.fixture
-def mock_argv_cft():
-    with patch("sys.argv", ["DATA-PUSH", "-p", "CFT"]):
-        yield
+def concrete_file_transfer_client():
+    """
+    Concrete subclass that overrides both abstract methods —
+    used to verify subclassing works correctly.
+    """
+    with patch("data_push_cft.client.file_transfer.HttpClient.__init__", return_value=None):
+        from data_push_cft.client.file_transfer import FileTransferClient
+        from pydantic import BaseModel
+        from requests import Response
 
+        class ConcreteClient(FileTransferClient):
+            def transfer_file(self, *args, **kwargs) -> BaseModel:
+                return MagicMock(spec=BaseModel)
 
-@pytest.fixture
-def mock_argv_internal():
-    with patch("sys.argv", ["DATA-PUSH", "-p", "INTERNAL"]):
-        yield
+            def health_check(self) -> Response:
+                return MagicMock(spec=Response)
 
-
-@pytest.fixture
-def mock_argv_default():
-    """No -p argument → default is ETL."""
-    with patch("sys.argv", ["DATA-PUSH"]):
-        yield
+        client = ConcreteClient.__new__(ConcreteClient)
+        yield client

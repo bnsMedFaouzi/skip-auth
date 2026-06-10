@@ -1,27 +1,40 @@
-import pytest
-from unittest.mock import MagicMock, patch
-
-
-@pytest.fixture
-def cft_app():
-    """Bypasses __init__ to avoid all dependency initialization."""
-    from data_push_cft.output_platform.cft.application import Cft
-    app = Cft.__new__(Cft)
-    app._client = MagicMock()
-    app._consumer = MagicMock()
-    app._producer = MagicMock()
-    app._file_manager = MagicMock()
-    return app
-
-
-@pytest.fixture
-def mock_file_info():
-    file_info = MagicMock()
-    file_info.path = "bucket/subdir/file.txt"
-    file_info.model_dump.return_value = {"name": "file.txt", "path": "bucket/subdir/file.txt"}
-    return file_info
-
-
-@pytest.fixture
-def mock_cft_flow():
-    return MagicMock()
+# ===========================================================================
+# upload_files
+# ===========================================================================
+ 
+def test_upload_files_returns_empty_list_when_no_cft_flows(cft_app):
+    mock_publication = MagicMock()
+    mock_publication.metadata.cft_flows = []
+    result = cft_app.upload_files(publication=mock_publication)
+    assert result == []
+ 
+ 
+def test_upload_files_calls_super_with_generated_prefix(cft_app):
+    mock_cft_flow = MagicMock()
+    mock_cft_flow.idf = "MY_IDF"
+    mock_cft_flow.part = "MY_PART"
+    mock_publication = MagicMock()
+    mock_publication.metadata.cft_flows = [mock_cft_flow]
+ 
+    with patch("data_push_cft.output_platform.cft.application.super") as mock_super, \
+         patch.object(cft_app, "serialise_cft_upload_files", return_value=[]):
+        mock_super.return_value.upload_files = MagicMock(return_value=[])
+        cft_app.upload_files(publication=mock_publication)
+ 
+    mock_super.return_value.upload_files.assert_called_once_with(
+        publication=mock_publication, prefix="MY_IDF/MY_PART"
+    )
+ 
+ 
+def test_upload_files_extends_result_with_serialised_files(cft_app):
+    mock_cft_flow = MagicMock()
+    mock_publication = MagicMock()
+    mock_publication.metadata.cft_flows = [mock_cft_flow, mock_cft_flow]
+    mock_cft_file = MagicMock()
+ 
+    with patch("data_push_cft.output_platform.cft.application.super") as mock_super, \
+         patch.object(cft_app, "serialise_cft_upload_files", return_value=[mock_cft_file]):
+        mock_super.return_value.upload_files.return_value = []
+        result = cft_app.upload_files(publication=mock_publication)
+ 
+    assert len(result) == 2

@@ -1,92 +1,180 @@
 import pytest
 from unittest.mock import patch
 
-from data_push_cft.output_platform.base.mixin import BaseApplicationMixin
-from data_push_cft.output_platform.base.event_handler import BaseEventHandler
-from data_push_cft.output_platform.base.file_manager import BaseFileManager
-from data_push_cft.output_platform.base.interface import BasePlatformInterface
+from tests.fixtures.cft_settings_fixtures import (
+    cft_settings_env,
+    cft_kafka_consumer_env,
+    cft_public_cos_env,
+)
 
 
 # ===========================================================================
-# __PLATFORM_NAME__
+# CftSettings — field loading
 # ===========================================================================
 
-def test_platform_name_value_is_base_platform():
-    assert BaseApplicationMixin.__PLATFORM_NAME__ == "BASE_PLATFORM"
+def test_cft_settings_base_url_loaded_from_env(cft_settings_env):
+    from data_push_cft.output_platform.cft.settings import CftSettings
+    settings = CftSettings()
+    assert settings.BASE_URL == "https://cft.example.com"
 
 
-def test_platform_name_is_string():
-    assert isinstance(BaseApplicationMixin.__PLATFORM_NAME__, str)
+def test_cft_settings_hvault_mountpoint_loaded_from_env(cft_settings_env):
+    from data_push_cft.output_platform.cft.settings import CftSettings
+    settings = CftSettings()
+    assert settings.CFT_HVAULT_MOUNTPOINT == "/vault/mount"
 
 
-def test_platform_name_is_uppercase():
-    assert BaseApplicationMixin.__PLATFORM_NAME__ == BaseApplicationMixin.__PLATFORM_NAME__.upper()
+def test_cft_settings_secret_path_loaded_from_env(cft_settings_env):
+    from data_push_cft.output_platform.cft.settings import CftSettings
+    settings = CftSettings()
+    assert settings.CFT_SECRET_PATH == "/secret/path"
 
 
-# ===========================================================================
-# Inheritance
-# ===========================================================================
-
-def test_inherits_from_base_file_manager():
-    assert issubclass(BaseApplicationMixin, BaseFileManager)
-
-
-def test_inherits_from_base_platform_interface():
-    assert issubclass(BaseApplicationMixin, BasePlatformInterface)
-
-
-def test_inherits_from_base_event_handler():
-    assert issubclass(BaseApplicationMixin, BaseEventHandler)
+def test_cft_settings_username_loaded_from_env(cft_settings_env):
+    from data_push_cft.output_platform.cft.settings import CftSettings
+    settings = CftSettings()
+    assert settings.CFT_UESRNAME == "cft-user"
 
 
 # ===========================================================================
-# MRO — resolution order
+# CftSettings — default values
 # ===========================================================================
 
-def test_mro_file_manager_before_platform_interface():
-    mro = BaseApplicationMixin.__mro__
-    assert mro.index(BaseFileManager) < mro.index(BasePlatformInterface)
+def test_cft_settings_default_transfer_file_uri(cft_settings_env):
+    from data_push_cft.output_platform.cft.settings import CftSettings
+    settings = CftSettings()
+    assert settings.TRANSFER_FILE_URI == "/cft/api/v1/transfers/files/outgoings"
 
 
-def test_mro_platform_interface_before_event_handler():
-    mro = BaseApplicationMixin.__mro__
-    assert mro.index(BasePlatformInterface) < mro.index(BaseEventHandler)
+def test_cft_settings_default_health_check_uri(cft_settings_env):
+    from data_push_cft.output_platform.cft.settings import CftSettings
+    settings = CftSettings()
+    assert settings.HEALTH_CHECK_URI == "/cft/api/v1/about"
 
 
-def test_mro_contains_all_three_bases():
-    mro = BaseApplicationMixin.__mro__
-    assert BaseFileManager in mro
-    assert BasePlatformInterface in mro
-    assert BaseEventHandler in mro
+def test_cft_settings_default_password_key(cft_settings_env):
+    from data_push_cft.output_platform.cft.settings import CftSettings
+    settings = CftSettings()
+    assert settings.CFT_PASSWORD_KEY == "password"
+
+
+def test_cft_settings_transfer_file_uri_can_be_overridden(cft_settings_env):
+    from data_push_cft.output_platform.cft.settings import CftSettings
+    with patch.dict("os.environ", {"CFT_TRANSFER_FILE_URI": "/custom/uri"}):
+        settings = CftSettings()
+    assert settings.TRANSFER_FILE_URI == "/custom/uri"
 
 
 # ===========================================================================
-# Inherited methods presence
+# CftSettings — computed properties
 # ===========================================================================
 
-def test_has_upload_files_from_file_manager():
-    assert hasattr(BaseApplicationMixin, "upload_files")
+def test_transfer_file_uri_template_concatenates_base_url_and_uri(cft_settings_env):
+    from data_push_cft.output_platform.cft.settings import CftSettings
+    settings = CftSettings()
+    expected = f"{settings.BASE_URL}{settings.TRANSFER_FILE_URI}"
+    assert settings.transfer_file_uri_template == expected
 
 
-def test_has_push_files_from_platform_interface():
-    assert hasattr(BaseApplicationMixin, "push_files")
+def test_transfer_file_uri_template_starts_with_base_url(cft_settings_env):
+    from data_push_cft.output_platform.cft.settings import CftSettings
+    settings = CftSettings()
+    assert settings.transfer_file_uri_template.startswith("https://cft.example.com")
 
 
-def test_has_notify_from_event_handler():
-    assert hasattr(BaseApplicationMixin, "notify")
+def test_transfer_file_uri_template_contains_transfer_path(cft_settings_env):
+    from data_push_cft.output_platform.cft.settings import CftSettings
+    settings = CftSettings()
+    assert "/cft/api/v1/transfers/files/outgoings" in settings.transfer_file_uri_template
 
 
-def test_has_check_liveness_from_platform_interface():
-    assert hasattr(BaseApplicationMixin, "check_liveness")
+def test_health_check_uri_concatenates_base_url_and_uri(cft_settings_env):
+    from data_push_cft.output_platform.cft.settings import CftSettings
+    settings = CftSettings()
+    expected = f"{settings.BASE_URL}{settings.HEALTH_CHECK_URI}"
+    assert settings.health_check_uri == expected
 
 
-def test_has_services_property_from_file_manager():
-    assert hasattr(BaseApplicationMixin, "services")
+def test_health_check_uri_starts_with_base_url(cft_settings_env):
+    from data_push_cft.output_platform.cft.settings import CftSettings
+    settings = CftSettings()
+    assert settings.health_check_uri.startswith("https://cft.example.com")
 
 
-def test_has_consumer_property_from_event_handler():
-    assert hasattr(BaseApplicationMixin, "consumer")
+def test_health_check_uri_contains_about_path(cft_settings_env):
+    from data_push_cft.output_platform.cft.settings import CftSettings
+    settings = CftSettings()
+    assert "/cft/api/v1/about" in settings.health_check_uri
 
 
-def test_has_client_property_from_platform_interface():
-    assert hasattr(BaseApplicationMixin, "client")
+# ===========================================================================
+# KafkaConsumerSettings
+# ===========================================================================
+
+def test_cft_kafka_topic_name_loaded_from_env(cft_kafka_consumer_env):
+    from data_push_cft.output_platform.cft.settings import KafkaConsumerSettings
+    settings = KafkaConsumerSettings()
+    assert settings.TOPIC_NAME == "cft-topic"
+
+
+def test_cft_kafka_group_name_loaded_from_env(cft_kafka_consumer_env):
+    from data_push_cft.output_platform.cft.settings import KafkaConsumerSettings
+    settings = KafkaConsumerSettings()
+    assert settings.GROUP_NAME == "cft-group"
+
+
+def test_cft_kafka_group_name_serialization_alias(cft_kafka_consumer_env):
+    from data_push_cft.output_platform.cft.settings import KafkaConsumerSettings
+    settings = KafkaConsumerSettings()
+    dumped = settings.model_dump(by_alias=True)
+    assert "group.id" in dumped
+
+
+def test_cft_kafka_group_name_serialized_value(cft_kafka_consumer_env):
+    from data_push_cft.output_platform.cft.settings import KafkaConsumerSettings
+    settings = KafkaConsumerSettings()
+    dumped = settings.model_dump(by_alias=True)
+    assert dumped["group.id"] == "cft-group"
+
+
+# ===========================================================================
+# PublicCosSettings
+# ===========================================================================
+
+def test_cft_public_cos_bucket_name_loaded_from_env(cft_public_cos_env):
+    from data_push_cft.output_platform.cft.settings import PublicCosSettings
+    settings = PublicCosSettings()
+    assert settings.BUCKET_NAME == "cft-bucket"
+
+
+def test_cft_public_cos_bucket_endpoint_loaded_from_env(cft_public_cos_env):
+    from data_push_cft.output_platform.cft.settings import PublicCosSettings
+    settings = PublicCosSettings()
+    assert settings.BUCKET_ENDPOINT == "https://cft-cos.example.com"
+
+
+def test_cft_public_cos_name_loaded_from_env(cft_public_cos_env):
+    from data_push_cft.output_platform.cft.settings import PublicCosSettings
+    settings = PublicCosSettings()
+    assert settings.COS_NAME == "cft-cos"
+
+
+def test_cft_public_cos_bucket_excluded_from_dump(cft_public_cos_env):
+    from data_push_cft.output_platform.cft.settings import PublicCosSettings
+    settings = PublicCosSettings()
+    dumped = settings.model_dump(by_alias=True)
+    assert "PUBLIC_DATA_PUSH_CFT_BUCKET" not in dumped
+
+
+def test_cft_public_cos_endpoint_excluded_from_dump(cft_public_cos_env):
+    from data_push_cft.output_platform.cft.settings import PublicCosSettings
+    settings = PublicCosSettings()
+    dumped = settings.model_dump(by_alias=True)
+    assert "PUBLIC_DATA_PUSH_CFT_BUCKET_ENDPOINT" not in dumped
+
+
+def test_cft_public_cos_name_excluded_from_dump(cft_public_cos_env):
+    from data_push_cft.output_platform.cft.settings import PublicCosSettings
+    settings = PublicCosSettings()
+    dumped = settings.model_dump(by_alias=True)
+    assert "PUBLIC_DATA_PUSH_CFT_COS_NAME" not in dumped

@@ -1,48 +1,44 @@
 import pytest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-
-# ---------------------------------------------------------------------------
-# CftSettings
-# ---------------------------------------------------------------------------
 
 @pytest.fixture
-def cft_settings_env():
-    env = {
-        "CFT_BASE_URL": "https://cft.example.com",
-        "CFT_HVAULT_MOUNTPOINT": "/vault/mount",
-        "CFT_SECRET_PATH": "/secret/path",
-        "CFT_UESRNAME": "cft-user",
-    }
-    with patch.dict("os.environ", env, clear=False):
-        yield env
+def mock_settings():
+    settings = MagicMock()
+    settings.transfer_file_uri_template = "https://cft.example.com/cft/api/v1/transfers/files/outgoings"
+    settings.health_check_uri = "https://cft.example.com/cft/api/v1/about"
+    settings.CFT_SECRET_PATH = "/secret/path"
+    settings.CFT_HVAULT_MOUNTPOINT = "/vault/mount"
+    settings.CFT_PASSWORD_KEY = "password"
+    settings.CFT_UESRNAME = "cft-user"
+    return settings
 
-
-# ---------------------------------------------------------------------------
-# KafkaConsumerSettings
-# ---------------------------------------------------------------------------
 
 @pytest.fixture
-def cft_kafka_consumer_env():
-    env = {
-        "KAFKA_TOPIC_PUBLIC_DATA_PUSH": "cft-topic",
-        "KAFKA_TOPIC_INTERNAL_DATA_PUSH_CFT_GROUP": "cft-group",
-    }
-    with patch.dict("os.environ", env, clear=False):
-        yield env
+def mock_hv_services():
+    secret = MagicMock()
+    secret.get_value.return_value.get_secret_value.return_value = "secret-password"
+    hv = MagicMock()
+    hv.get_secret.return_value = secret
+    return hv
 
-
-# ---------------------------------------------------------------------------
-# PublicCosSettings
-# ---------------------------------------------------------------------------
 
 @pytest.fixture
-def cft_public_cos_env():
-    env = {
-        "PUBLIC_DATA_PUSH_CFT_BUCKET": "cft-bucket",
-        "PUBLIC_DATA_PUSH_CFT_BUCKET_ENDPOINT": "https://cft-cos.example.com",
-        "PUBLIC_DATA_PUSH_CFT_COS_NAME": "cft-cos",
-        "API_ETL_PROVIDER_NAME": "cft-provider",
-    }
-    with patch.dict("os.environ", env, clear=False):
-        yield env
+def mock_file_info():
+    file_info = MagicMock()
+    file_info.path = "/some/path/file.txt"
+    file_info.pivot_filename = "file.txt"
+    file_info.cft_flow.model_dump.return_value = {"apitimeout": 30}
+    return file_info
+
+
+@pytest.fixture
+def cft_client(mock_settings, mock_hv_services):
+    from data_push_cft.output_platform.cft.client import CftClient
+    with patch("data_push_cft.output_platform.cft.client.HvaultSecretManager", return_value=mock_hv_services), \
+         patch("data_push_cft.output_platform.cft.client.HvaultSettings"), \
+         patch.object(CftClient, "__init__", lambda self, settings: None):
+        client = CftClient.__new__(CftClient)
+        client._settings = mock_settings
+        client._hv_services = mock_hv_services
+        yield client

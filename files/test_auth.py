@@ -1,336 +1,220 @@
-import os
-import sys
 import pytest
 from unittest.mock import MagicMock, patch, call
+from fastapi import HTTPException
+from pydantic import BaseModel
 
-from tests.fixtures.event_handler_fixtures import (
-    mock_consumer,
-    mock_producer,
-    mock_publication,
+from tests.fixtures.interface_fixtures import (
+    mock_client,
+    mock_client_settings_class,
+    mock_client_class,
     mock_file_info,
-    mock_consumer_settings_class,
-    mock_producer_settings_class,
-    mock_consumer_class,
-    mock_producer_class,
-    event_handler,
-    event_handler_no_notify,
-    event_handler_no_producer,
+    mock_files_info,
+    http_exception_rejected,
+    http_exception_retryable,
+    http_exception_unknown,
+    interface,
 )
 
 
 # ===========================================================================
-# __init__ — consumer & producer initialization
+# __init__ — client initialization
 # ===========================================================================
 
-def test_init_sets_consumer(event_handler, mock_consumer):
-    assert event_handler._consumer is mock_consumer
+def test_init_creates_client_with_settings(mock_client_settings_class, mock_client_class):
+    from data_push_cft.output_platform.base.interface import BasePlatformInterface
+
+    handler = BasePlatformInterface.__new__(BasePlatformInterface)
+
+    def fake_get_class_type(attr_name):
+        return {
+            "PLATFORM_CLIENT_SETTINGS_CLASS": mock_client_settings_class,
+        }.get(attr_name)
+
+    with patch.object(handler, "_get_class_type", side_effect=fake_get_class_type), \
+         patch.object(handler, "_get_client_class", return_value=mock_client_class):
+        handler.__init__()
+
+    mock_client_settings_class.assert_called_once()
+    mock_client_class.assert_called_once_with(settings=mock_client_settings_class.return_value)
 
 
-def test_init_sets_producer(event_handler, mock_producer):
-    assert event_handler._producer is mock_producer
+def test_init_sets_client_instance(mock_client_settings_class, mock_client_class):
+    from data_push_cft.output_platform.base.interface import BasePlatformInterface
+
+    handler = BasePlatformInterface.__new__(BasePlatformInterface)
+
+    def fake_get_class_type(attr_name):
+        return {
+            "PLATFORM_CLIENT_SETTINGS_CLASS": mock_client_settings_class,
+        }.get(attr_name)
+
+    with patch.object(handler, "_get_class_type", side_effect=fake_get_class_type), \
+         patch.object(handler, "_get_client_class", return_value=mock_client_class):
+        handler.__init__()
+
+    assert handler._client is mock_client_class.return_value
 
 
 # ===========================================================================
-# consumer / producer properties
+# client property
 # ===========================================================================
 
-def test_consumer_property_returns_consumer(event_handler, mock_consumer):
-    assert event_handler.consumer is mock_consumer
-
-
-def test_producer_property_returns_producer(event_handler, mock_producer):
-    assert event_handler.producer is mock_producer
+def test_client_property_returns_client(interface, mock_client):
+    assert interface.client is mock_client
 
 
 # ===========================================================================
-# notify — consumer.commit always called
+# push_files
 # ===========================================================================
 
-def test_notify_always_commits_consumer(event_handler, mock_consumer, mock_publication):
-    event_handler.notify(publication=mock_publication)
-    mock_consumer.commit.assert_called_once()
+def test_push_files_returns_list(interface, mock_files_info):
+    with patch.object(interface, "_push_file", return_value=MagicMock(spec=BaseModel)):
+        result = interface.push_files(mock_files_info)
+    assert isinstance(result, list)
 
 
-def test_notify_commits_even_when_no_notify_flag(event_handler_no_notify, mock_consumer, mock_publication):
-    event_handler_no_notify.notify(publication=mock_publication)
-    mock_consumer.commit.assert_called_once()
+def test_push_files_returns_one_result_per_file(interface, mock_files_info):
+    with patch.object(interface, "_push_file", return_value=MagicMock(spec=BaseModel)):
+        result = interface.push_files(mock_files_info)
+    assert len(result) == len(mock_files_info)
 
 
-# ===========================================================================
-# notify — early returns
-# ===========================================================================
+def test_push_files_calls_push_file_for_each_file(interface, mock_files_info):
+    with patch.object(interface, "_push_file", return_value=MagicMock()) as mock_push:
+        interface.push_files(mock_files_info)
+    assert mock_push.call_count == len(mock_files_info)
 
-def test_notify_returns_early_when_notify_false_and_no_error_detail(
-    event_handler_no_notify, mock_producer, mock_publication
+
+def test_push_files_passes_kwargs_to_push_file(interface, mock_files_info):
+    with patch.object(interface, "_push_file", return_value=MagicMock()) as mock_push:
+        interface.push_files(mock_files_info, bucket="my-bucket", prefix="data/")
+    for c in mock_push.call_args_list:
+        assert c.kwargs.get("bucket") == "my-bucket"
+        assert c.kwargs.get("prefix") == "data/"
+
+
+def test_push_files_calls_resolve_action_on_http_exception(
+    interface, mock_files_info, http_exception_rejected
 ):
-    event_handler_no_notify.notify(publication=mock_publication)
-    mock_producer.produce_event.assert_not_called()
+    with patch.object(interface, "_push_file", side_effect=http_exception_rejected), \
+         patch.object(interface, "_resolve_action") as mock_resolve:
+        interface.push_files(mock_files_info)
+    mock_resolve.assert_called_once_with(http_exception_rejected)
 
 
-def test_notify_does_not_return_early_when_notify_false_but_error_detail_given(
-    event_handler_no_notify, mock_producer, mock_publication
+def test_push_files_with_empty_list_returns_empty_list(interface):
+    result = interface.push_files([])
+    assert result == []
+
+
+# ===========================================================================
+# check_liveness
+# ===========================================================================
+
+def test_check_liveness_calls_health_check(interface, mock_client):
+    interface.check_liveness()
+    mock_client.health_check.assert_called_once()
+
+
+def test_check_liveness_calls_resolve_action_on_http_exception(
+    interface, mock_client, http_exception_retryable
 ):
-    with patch.object(event_handler_no_notify, "_serialize_public_event", return_value=MagicMock()):
-        event_handler_no_notify.notify(
-            publication=mock_publication, error_detail="some error"
-        )
-    mock_producer.produce_event.assert_called_once()
+    mock_client.health_check.side_effect = http_exception_retryable
+    with patch.object(interface, "_resolve_action") as mock_resolve:
+        interface.check_liveness()
+    mock_resolve.assert_called_once_with(http_exception_retryable)
 
 
-def test_notify_returns_early_when_no_producer(
-    event_handler_no_producer, mock_publication
+# ===========================================================================
+# _resolve_action
+# ===========================================================================
+
+def test_resolve_action_raises_rejected_exception_for_4xx(
+    interface, http_exception_rejected
 ):
-    # Should not raise, just return early
-    event_handler_no_producer.notify(publication=mock_publication)
+    from data_push_cft.output_platform.exceptiones import RejectedException
+    with pytest.raises(RejectedException):
+        interface._resolve_action(http_exception_rejected)
 
 
-# ===========================================================================
-# notify — error_detail sets REJECTED event
-# ===========================================================================
-
-def test_notify_sets_rejected_event_when_error_detail(event_handler, mock_publication):
-    mock_public_event = MagicMock()
-    with patch.object(
-        event_handler, "_serialize_public_event", return_value=mock_public_event
-    ), patch(
-        "data_push_cft.output_platform.base.event_handler.MercuryPublicationEvent"
-    ) as mock_event_enum:
-        event_handler.notify(publication=mock_publication, error_detail="transfer failed")
-        assert mock_public_event.event == mock_event_enum.REJECTED
-
-
-def test_notify_sets_error_detail_on_event(event_handler, mock_publication):
-    mock_public_event = MagicMock()
-    with patch.object(
-        event_handler, "_serialize_public_event", return_value=mock_public_event
-    ), patch("data_push_cft.output_platform.base.event_handler.MercuryPublicationEvent"):
-        event_handler.notify(publication=mock_publication, error_detail="transfer failed")
-        assert mock_public_event.detail == {"exception": "transfer failed"}
-
-
-def test_notify_does_not_set_rejected_event_without_error_detail(event_handler, mock_publication):
-    mock_public_event = MagicMock()
-    with patch.object(event_handler, "_serialize_public_event", return_value=mock_public_event):
-        event_handler.notify(publication=mock_publication)
-        mock_public_event.event  # should not have been set to REJECTED
-        assert "event" not in mock_public_event.__dict__ or mock_public_event.event != "REJECTED"
-
-
-# ===========================================================================
-# notify — produce_event called with correct args
-# ===========================================================================
-
-def test_notify_calls_produce_event_with_publication_key(
-    event_handler, mock_producer, mock_publication
+def test_resolve_action_raises_retryable_exception_for_5xx(
+    interface, http_exception_retryable
 ):
-    mock_public_event = MagicMock()
-    with patch.object(event_handler, "_serialize_public_event", return_value=mock_public_event):
-        event_handler.notify(publication=mock_publication)
-    mock_producer.produce_event.assert_called_once_with(
-        value=mock_public_event, key=mock_publication.key
-    )
+    from data_push_cft.output_platform.exceptiones import RetryableException
+    with pytest.raises(RetryableException):
+        interface._resolve_action(http_exception_retryable)
 
 
-def test_notify_uses_empty_list_when_transferred_files_none(event_handler, mock_publication):
-    with patch.object(
-        event_handler, "_serialize_public_event", return_value=MagicMock()
-    ) as mock_serialize:
-        event_handler.notify(publication=mock_publication, transferred_files=None)
-        mock_serialize.assert_called_once_with(mock_publication, [])
-
-
-def test_notify_passes_transferred_files_to_serialize(
-    event_handler, mock_publication, mock_file_info
+def test_resolve_action_does_not_raise_for_unknown_status(
+    interface, http_exception_unknown
 ):
-    with patch.object(
-        event_handler, "_serialize_public_event", return_value=MagicMock()
-    ) as mock_serialize:
-        event_handler.notify(publication=mock_publication, transferred_files=mock_file_info)
-        mock_serialize.assert_called_once_with(mock_publication, mock_file_info)
+    # 3xx — neither rejected nor retryable → no exception
+    interface._resolve_action(http_exception_unknown)
+
+
+def test_resolve_action_rejected_status_boundary_400(interface):
+    from data_push_cft.output_platform.exceptiones import RejectedException
+    e = HTTPException(status_code=400)
+    with pytest.raises(RejectedException):
+        interface._resolve_action(e)
+
+
+def test_resolve_action_rejected_status_boundary_499(interface):
+    from data_push_cft.output_platform.exceptiones import RejectedException
+    e = HTTPException(status_code=499)
+    with pytest.raises(RejectedException):
+        interface._resolve_action(e)
+
+
+def test_resolve_action_retryable_status_boundary_500(interface):
+    from data_push_cft.output_platform.exceptiones import RetryableException
+    e = HTTPException(status_code=500)
+    with pytest.raises(RetryableException):
+        interface._resolve_action(e)
+
+
+def test_resolve_action_retryable_status_boundary_599(interface):
+    from data_push_cft.output_platform.exceptiones import RetryableException
+    e = HTTPException(status_code=599)
+    with pytest.raises(RetryableException):
+        interface._resolve_action(e)
 
 
 # ===========================================================================
-# notify — ProducerDeliveryException → sys.exit
+# _get_client_class
 # ===========================================================================
 
-def test_notify_calls_sys_exit_on_producer_delivery_exception(
-    event_handler, mock_producer, mock_publication
-):
-    from bnppam_mercury.core.kafka.exceptions import ProducerDeliveryException
-
-    mock_producer.produce_event.side_effect = ProducerDeliveryException("delivery failed")
-
-    with patch.object(event_handler, "_serialize_public_event", return_value=MagicMock()), \
-         patch("data_push_cft.output_platform.base.event_handler.sys.exit") as mock_exit, \
-         patch("data_push_cft.output_platform.base.event_handler.logger"):
-        event_handler.notify(publication=mock_publication)
-        mock_exit.assert_called_once_with(os.EX_SOFTWARE)
+def test_get_client_class_delegates_to_get_class_type(interface):
+    mock_class = MagicMock()
+    with patch.object(interface, "_get_class_type", return_value=mock_class) as mock_get:
+        result = interface._get_client_class()
+    mock_get.assert_called_once_with("PLATFORM_CLIENT_CLASS")
+    assert result is mock_class
 
 
 # ===========================================================================
-# _serialize_public_event
+# _push_file
 # ===========================================================================
 
-def test_serialize_public_event_returns_serialized_message(
-    event_handler, mock_producer, mock_publication
-):
-    mock_result = MagicMock()
-    mock_producer.serialize_message.return_value = mock_result
+def test_push_file_calls_client_transfer_file(interface, mock_client, mock_file_info):
+    interface._push_file(mock_file_info)
+    mock_client.transfer_file.assert_called_once()
 
-    result = event_handler._serialize_public_event(mock_publication, [])
+
+def test_push_file_passes_file_info_to_transfer_file(interface, mock_client, mock_file_info):
+    interface._push_file(mock_file_info)
+    call_args = mock_client.transfer_file.call_args
+    assert mock_file_info in call_args.args or mock_file_info in call_args.kwargs.values()
+
+
+def test_push_file_passes_kwargs_to_transfer_file(interface, mock_client, mock_file_info):
+    interface._push_file(mock_file_info, bucket="test-bucket")
+    call_kwargs = mock_client.transfer_file.call_args.kwargs
+    assert call_kwargs.get("bucket") == "test-bucket"
+
+
+def test_push_file_returns_result_from_transfer_file(interface, mock_client, mock_file_info):
+    mock_result = MagicMock(spec=BaseModel)
+    mock_client.transfer_file.return_value = mock_result
+    result = interface._push_file(mock_file_info)
     assert result is mock_result
-
-
-def test_serialize_public_event_calls_producer_serialize_message(
-    event_handler, mock_producer, mock_publication
-):
-    event_handler._serialize_public_event(mock_publication, [])
-    mock_producer.serialize_message.assert_called_once_with(mock_publication)
-
-
-def test_serialize_public_event_with_transferred_files_still_calls_serialize(
-    event_handler, mock_producer, mock_publication, mock_file_info
-):
-    event_handler._serialize_public_event(mock_publication, mock_file_info)
-    mock_producer.serialize_message.assert_called_once_with(mock_publication)
-
-
-# ===========================================================================
-# __init_consumer__
-# Fix: patch _get_class_type directly to bypass issubclass() on MagicMock
-# ===========================================================================
-
-def test_init_consumer_returns_consumer_instance(
-    mock_consumer_settings_class, mock_consumer_class
-):
-    from data_push_cft.output_platform.base.event_handler import BaseEventHandler
-
-    handler = BaseEventHandler.__new__(BaseEventHandler)
-
-    def fake_get_class_type(attr_name):
-        return {
-            "CONSUMER_SETTING_CLASS": mock_consumer_settings_class,
-            "CONSUMER_CLASS": mock_consumer_class,
-        }.get(attr_name)
-
-    with patch.object(handler, "_get_class_type", side_effect=fake_get_class_type):
-        result = handler.__init_consumer__()
-
-    mock_consumer_class.assert_called_once()
-    assert result is mock_consumer_class.return_value
-
-
-def test_init_consumer_instantiates_settings(
-    mock_consumer_settings_class, mock_consumer_class
-):
-    from data_push_cft.output_platform.base.event_handler import BaseEventHandler
-
-    handler = BaseEventHandler.__new__(BaseEventHandler)
-
-    def fake_get_class_type(attr_name):
-        return {
-            "CONSUMER_SETTING_CLASS": mock_consumer_settings_class,
-            "CONSUMER_CLASS": mock_consumer_class,
-        }.get(attr_name)
-
-    with patch.object(handler, "_get_class_type", side_effect=fake_get_class_type):
-        handler.__init_consumer__()
-
-    mock_consumer_settings_class.assert_called_once()
-
-
-def test_init_consumer_passes_settings_to_consumer(
-    mock_consumer_settings_class, mock_consumer_class
-):
-    from data_push_cft.output_platform.base.event_handler import BaseEventHandler
-
-    handler = BaseEventHandler.__new__(BaseEventHandler)
-
-    def fake_get_class_type(attr_name):
-        return {
-            "CONSUMER_SETTING_CLASS": mock_consumer_settings_class,
-            "CONSUMER_CLASS": mock_consumer_class,
-        }.get(attr_name)
-
-    with patch.object(handler, "_get_class_type", side_effect=fake_get_class_type):
-        handler.__init_consumer__()
-
-    mock_consumer_class.assert_called_once_with(
-        settings=mock_consumer_settings_class.return_value
-    )
-
-
-# ===========================================================================
-# __init_producer__
-# Fix: patch _get_class_type directly to bypass issubclass() on MagicMock
-# ===========================================================================
-
-def test_init_producer_returns_producer_instance(
-    mock_producer_settings_class, mock_producer_class
-):
-    from data_push_cft.output_platform.base.event_handler import BaseEventHandler
-
-    handler = BaseEventHandler.__new__(BaseEventHandler)
-
-    def fake_get_class_type(attr_name):
-        return {
-            "PRODUCER_CLASS": mock_producer_class,
-            "PRODUCER_SETTING_CLASS": mock_producer_settings_class,
-        }.get(attr_name)
-
-    with patch.object(handler, "_get_class_type", side_effect=fake_get_class_type):
-        result = handler.__init_producer__()
-
-    mock_producer_class.assert_called_once()
-    assert result is mock_producer_class.return_value
-
-
-def test_init_producer_returns_none_when_producer_class_is_none():
-    from data_push_cft.output_platform.base.event_handler import BaseEventHandler
-
-    handler = BaseEventHandler.__new__(BaseEventHandler)
-
-    with patch.object(handler, "_get_class_type", return_value=None):
-        result = handler.__init_producer__()
-
-    assert result is None
-
-
-def test_init_producer_instantiates_settings(
-    mock_producer_settings_class, mock_producer_class
-):
-    from data_push_cft.output_platform.base.event_handler import BaseEventHandler
-
-    handler = BaseEventHandler.__new__(BaseEventHandler)
-
-    def fake_get_class_type(attr_name):
-        return {
-            "PRODUCER_CLASS": mock_producer_class,
-            "PRODUCER_SETTING_CLASS": mock_producer_settings_class,
-        }.get(attr_name)
-
-    with patch.object(handler, "_get_class_type", side_effect=fake_get_class_type):
-        handler.__init_producer__()
-
-    mock_producer_settings_class.assert_called_once()
-
-
-def test_init_producer_passes_settings_to_producer(
-    mock_producer_settings_class, mock_producer_class
-):
-    from data_push_cft.output_platform.base.event_handler import BaseEventHandler
-
-    handler = BaseEventHandler.__new__(BaseEventHandler)
-
-    def fake_get_class_type(attr_name):
-        return {
-            "PRODUCER_CLASS": mock_producer_class,
-            "PRODUCER_SETTING_CLASS": mock_producer_settings_class,
-        }.get(attr_name)
-
-    with patch.object(handler, "_get_class_type", side_effect=fake_get_class_type):
-        handler.__init_producer__()
-
-    mock_producer_class.assert_called_once_with(
-        kafka_settings=mock_producer_settings_class.return_value
-    )

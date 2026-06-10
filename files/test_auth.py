@@ -1,180 +1,209 @@
 import pytest
-from unittest.mock import patch
-
-from tests.fixtures.cft_settings_fixtures import (
-    cft_settings_env,
-    cft_kafka_consumer_env,
-    cft_public_cos_env,
-)
+from typing import Optional
+from unittest.mock import MagicMock, patch
 
 
 # ===========================================================================
-# CftSettings — field loading
+# TransferRequestPrams
 # ===========================================================================
 
-def test_cft_settings_base_url_loaded_from_env(cft_settings_env):
-    from data_push_cft.output_platform.cft.settings import CftSettings
-    settings = CftSettings()
-    assert settings.BASE_URL == "https://cft.example.com"
+def test_transfer_request_prams_apitimeout_defaults_to_none():
+    from data_push_cft.output_platform.cft.schemas import TransferRequestPrams
+    params = TransferRequestPrams()
+    assert params.apitimeout is None
 
 
-def test_cft_settings_hvault_mountpoint_loaded_from_env(cft_settings_env):
-    from data_push_cft.output_platform.cft.settings import CftSettings
-    settings = CftSettings()
-    assert settings.CFT_HVAULT_MOUNTPOINT == "/vault/mount"
+def test_transfer_request_prams_apitimeout_accepts_int():
+    from data_push_cft.output_platform.cft.schemas import TransferRequestPrams
+    params = TransferRequestPrams(apitimeout=30)
+    assert params.apitimeout == 30
 
 
-def test_cft_settings_secret_path_loaded_from_env(cft_settings_env):
-    from data_push_cft.output_platform.cft.settings import CftSettings
-    settings = CftSettings()
-    assert settings.CFT_SECRET_PATH == "/secret/path"
+def test_transfer_request_prams_apitimeout_serialization_alias():
+    from data_push_cft.output_platform.cft.schemas import TransferRequestPrams
+    params = TransferRequestPrams(apitimeout=30)
+    dumped = params.model_dump(by_alias=True)
+    assert "apitimeout" in dumped
 
 
-def test_cft_settings_username_loaded_from_env(cft_settings_env):
-    from data_push_cft.output_platform.cft.settings import CftSettings
-    settings = CftSettings()
-    assert settings.CFT_UESRNAME == "cft-user"
+def test_transfer_request_prams_apitimeout_serialized_value():
+    from data_push_cft.output_platform.cft.schemas import TransferRequestPrams
+    params = TransferRequestPrams(apitimeout=30)
+    dumped = params.model_dump(by_alias=True)
+    assert dumped["apitimeout"] == 30
 
 
-# ===========================================================================
-# CftSettings — default values
-# ===========================================================================
-
-def test_cft_settings_default_transfer_file_uri(cft_settings_env):
-    from data_push_cft.output_platform.cft.settings import CftSettings
-    settings = CftSettings()
-    assert settings.TRANSFER_FILE_URI == "/cft/api/v1/transfers/files/outgoings"
-
-
-def test_cft_settings_default_health_check_uri(cft_settings_env):
-    from data_push_cft.output_platform.cft.settings import CftSettings
-    settings = CftSettings()
-    assert settings.HEALTH_CHECK_URI == "/cft/api/v1/about"
-
-
-def test_cft_settings_default_password_key(cft_settings_env):
-    from data_push_cft.output_platform.cft.settings import CftSettings
-    settings = CftSettings()
-    assert settings.CFT_PASSWORD_KEY == "password"
-
-
-def test_cft_settings_transfer_file_uri_can_be_overridden(cft_settings_env):
-    from data_push_cft.output_platform.cft.settings import CftSettings
-    with patch.dict("os.environ", {"CFT_TRANSFER_FILE_URI": "/custom/uri"}):
-        settings = CftSettings()
-    assert settings.TRANSFER_FILE_URI == "/custom/uri"
+def test_transfer_request_prams_apitimeout_none_in_dump():
+    from data_push_cft.output_platform.cft.schemas import TransferRequestPrams
+    params = TransferRequestPrams()
+    dumped = params.model_dump(by_alias=True)
+    assert dumped["apitimeout"] is None
 
 
 # ===========================================================================
-# CftSettings — computed properties
+# TransferRequestBody
 # ===========================================================================
 
-def test_transfer_file_uri_template_concatenates_base_url_and_uri(cft_settings_env):
-    from data_push_cft.output_platform.cft.settings import CftSettings
-    settings = CftSettings()
-    expected = f"{settings.BASE_URL}{settings.TRANSFER_FILE_URI}"
-    assert settings.transfer_file_uri_template == expected
+def test_transfer_request_body_requires_filename():
+    from data_push_cft.output_platform.cft.schemas import TransferRequestBody
+    with pytest.raises(Exception):
+        TransferRequestBody()
 
 
-def test_transfer_file_uri_template_starts_with_base_url(cft_settings_env):
-    from data_push_cft.output_platform.cft.settings import CftSettings
-    settings = CftSettings()
-    assert settings.transfer_file_uri_template.startswith("https://cft.example.com")
+def test_transfer_request_body_filename_assigned():
+    from data_push_cft.output_platform.cft.schemas import TransferRequestBody
+    body = TransferRequestBody(filename="test.txt")
+    assert body.filename == "test.txt"
 
 
-def test_transfer_file_uri_template_contains_transfer_path(cft_settings_env):
-    from data_push_cft.output_platform.cft.settings import CftSettings
-    settings = CftSettings()
-    assert "/cft/api/v1/transfers/files/outgoings" in settings.transfer_file_uri_template
+def test_transfer_request_body_filename_serialization_alias():
+    from data_push_cft.output_platform.cft.schemas import TransferRequestBody
+    body = TransferRequestBody(filename="test.txt")
+    dumped = body.model_dump(by_alias=True)
+    assert "fname" in dumped
+    assert dumped["fname"] == "test.txt"
 
 
-def test_health_check_uri_concatenates_base_url_and_uri(cft_settings_env):
-    from data_push_cft.output_platform.cft.settings import CftSettings
-    settings = CftSettings()
-    expected = f"{settings.BASE_URL}{settings.HEALTH_CHECK_URI}"
-    assert settings.health_check_uri == expected
+def test_transfer_request_body_parm_defaults_to_none():
+    from data_push_cft.output_platform.cft.schemas import TransferRequestBody
+    body = TransferRequestBody(filename="test.txt")
+    assert body.parm is None
 
 
-def test_health_check_uri_starts_with_base_url(cft_settings_env):
-    from data_push_cft.output_platform.cft.settings import CftSettings
-    settings = CftSettings()
-    assert settings.health_check_uri.startswith("https://cft.example.com")
+def test_transfer_request_body_parm_accepts_value():
+    from data_push_cft.output_platform.cft.schemas import TransferRequestBody
+    body = TransferRequestBody(filename="test.txt", parm="my-param")
+    assert body.parm == "my-param"
 
 
-def test_health_check_uri_contains_about_path(cft_settings_env):
-    from data_push_cft.output_platform.cft.settings import CftSettings
-    settings = CftSettings()
-    assert "/cft/api/v1/about" in settings.health_check_uri
+def test_transfer_request_body_parm_serialization_alias():
+    from data_push_cft.output_platform.cft.schemas import TransferRequestBody
+    body = TransferRequestBody(filename="test.txt", parm="val")
+    dumped = body.model_dump(by_alias=True)
+    assert "parm" in dumped
+    assert dumped["parm"] == "val"
 
 
-# ===========================================================================
-# KafkaConsumerSettings
-# ===========================================================================
-
-def test_cft_kafka_topic_name_loaded_from_env(cft_kafka_consumer_env):
-    from data_push_cft.output_platform.cft.settings import KafkaConsumerSettings
-    settings = KafkaConsumerSettings()
-    assert settings.TOPIC_NAME == "cft-topic"
+def test_transfer_request_body_sync_defaults_to_yes():
+    from data_push_cft.output_platform.cft.schemas import TransferRequestBody
+    body = TransferRequestBody(filename="test.txt")
+    assert body.sync == "YES"
 
 
-def test_cft_kafka_group_name_loaded_from_env(cft_kafka_consumer_env):
-    from data_push_cft.output_platform.cft.settings import KafkaConsumerSettings
-    settings = KafkaConsumerSettings()
-    assert settings.GROUP_NAME == "cft-group"
+def test_transfer_request_body_sync_can_be_overridden():
+    from data_push_cft.output_platform.cft.schemas import TransferRequestBody
+    body = TransferRequestBody(filename="test.txt", sync="NO")
+    assert body.sync == "NO"
 
 
-def test_cft_kafka_group_name_serialization_alias(cft_kafka_consumer_env):
-    from data_push_cft.output_platform.cft.settings import KafkaConsumerSettings
-    settings = KafkaConsumerSettings()
-    dumped = settings.model_dump(by_alias=True)
-    assert "group.id" in dumped
-
-
-def test_cft_kafka_group_name_serialized_value(cft_kafka_consumer_env):
-    from data_push_cft.output_platform.cft.settings import KafkaConsumerSettings
-    settings = KafkaConsumerSettings()
-    dumped = settings.model_dump(by_alias=True)
-    assert dumped["group.id"] == "cft-group"
+def test_transfer_request_body_sync_serialization_alias():
+    from data_push_cft.output_platform.cft.schemas import TransferRequestBody
+    body = TransferRequestBody(filename="test.txt")
+    dumped = body.model_dump(by_alias=True)
+    assert "sync" in dumped
+    assert dumped["sync"] == "YES"
 
 
 # ===========================================================================
-# PublicCosSettings
+# CredsTransfer
 # ===========================================================================
 
-def test_cft_public_cos_bucket_name_loaded_from_env(cft_public_cos_env):
-    from data_push_cft.output_platform.cft.settings import PublicCosSettings
-    settings = PublicCosSettings()
-    assert settings.BUCKET_NAME == "cft-bucket"
+def test_creds_transfer_requires_username_and_password():
+    from data_push_cft.output_platform.cft.schemas import CredsTransfer
+    with pytest.raises(Exception):
+        CredsTransfer()
 
 
-def test_cft_public_cos_bucket_endpoint_loaded_from_env(cft_public_cos_env):
-    from data_push_cft.output_platform.cft.settings import PublicCosSettings
-    settings = PublicCosSettings()
-    assert settings.BUCKET_ENDPOINT == "https://cft-cos.example.com"
+def test_creds_transfer_username_assigned():
+    from data_push_cft.output_platform.cft.schemas import CredsTransfer
+    creds = CredsTransfer(username="user", password="secret")
+    assert creds.username == "user"
 
 
-def test_cft_public_cos_name_loaded_from_env(cft_public_cos_env):
-    from data_push_cft.output_platform.cft.settings import PublicCosSettings
-    settings = PublicCosSettings()
-    assert settings.COS_NAME == "cft-cos"
+def test_creds_transfer_password_assigned():
+    from data_push_cft.output_platform.cft.schemas import CredsTransfer
+    creds = CredsTransfer(username="user", password="secret")
+    assert creds.password == "secret"
 
 
-def test_cft_public_cos_bucket_excluded_from_dump(cft_public_cos_env):
-    from data_push_cft.output_platform.cft.settings import PublicCosSettings
-    settings = PublicCosSettings()
-    dumped = settings.model_dump(by_alias=True)
-    assert "PUBLIC_DATA_PUSH_CFT_BUCKET" not in dumped
+def test_creds_transfer_username_is_str():
+    from data_push_cft.output_platform.cft.schemas import CredsTransfer
+    creds = CredsTransfer(username="user", password="secret")
+    assert isinstance(creds.username, str)
 
 
-def test_cft_public_cos_endpoint_excluded_from_dump(cft_public_cos_env):
-    from data_push_cft.output_platform.cft.settings import PublicCosSettings
-    settings = PublicCosSettings()
-    dumped = settings.model_dump(by_alias=True)
-    assert "PUBLIC_DATA_PUSH_CFT_BUCKET_ENDPOINT" not in dumped
+def test_creds_transfer_password_is_str():
+    from data_push_cft.output_platform.cft.schemas import CredsTransfer
+    creds = CredsTransfer(username="user", password="secret")
+    assert isinstance(creds.password, str)
 
 
-def test_cft_public_cos_name_excluded_from_dump(cft_public_cos_env):
-    from data_push_cft.output_platform.cft.settings import PublicCosSettings
-    settings = PublicCosSettings()
-    dumped = settings.model_dump(by_alias=True)
-    assert "PUBLIC_DATA_PUSH_CFT_COS_NAME" not in dumped
+# ===========================================================================
+# TransferRequest
+# ===========================================================================
+
+def test_transfer_request_requires_all_fields():
+    from data_push_cft.output_platform.cft.schemas import TransferRequest
+    with pytest.raises(Exception):
+        TransferRequest()
+
+
+def test_transfer_request_idtu_assigned():
+    from data_push_cft.output_platform.cft.schemas import TransferRequest
+    req = TransferRequest(idtu="IDTU123", ida="IDA456", idt="IDT789")
+    assert req.idtu == "IDTU123"
+
+
+def test_transfer_request_ida_assigned():
+    from data_push_cft.output_platform.cft.schemas import TransferRequest
+    req = TransferRequest(idtu="IDTU123", ida="IDA456", idt="IDT789")
+    assert req.ida == "IDA456"
+
+
+def test_transfer_request_idt_assigned():
+    from data_push_cft.output_platform.cft.schemas import TransferRequest
+    req = TransferRequest(idtu="IDTU123", ida="IDA456", idt="IDT789")
+    assert req.idt == "IDT789"
+
+
+def test_transfer_request_all_fields_are_str():
+    from data_push_cft.output_platform.cft.schemas import TransferRequest
+    req = TransferRequest(idtu="IDTU123", ida="IDA456", idt="IDT789")
+    assert isinstance(req.idtu, str)
+    assert isinstance(req.ida, str)
+    assert isinstance(req.idt, str)
+
+
+# ===========================================================================
+# CftFileInfo — pivot_filename property
+# ===========================================================================
+
+def test_cft_file_info_pivot_filename_returns_basename():
+    from data_push_cft.output_platform.cft.schemas import CftFileInfo
+    file_info = CftFileInfo(name="/some/path/to/file.txt", cft_flow=MagicMock())
+    assert file_info.pivot_filename == "file.txt"
+
+
+def test_cft_file_info_pivot_filename_with_simple_name():
+    from data_push_cft.output_platform.cft.schemas import CftFileInfo
+    file_info = CftFileInfo(name="myfile.csv", cft_flow=MagicMock())
+    assert file_info.pivot_filename == "myfile.csv"
+
+
+def test_cft_file_info_pivot_filename_with_nested_path():
+    from data_push_cft.output_platform.cft.schemas import CftFileInfo
+    file_info = CftFileInfo(name="/a/b/c/d/report.json", cft_flow=MagicMock())
+    assert file_info.pivot_filename == "report.json"
+
+
+def test_cft_file_info_pivot_filename_strips_directory():
+    from data_push_cft.output_platform.cft.schemas import CftFileInfo
+    file_info = CftFileInfo(name="/dir/subdir/data.parquet", cft_flow=MagicMock())
+    assert "/" not in file_info.pivot_filename
+
+
+def test_cft_file_info_cft_flow_assigned():
+    from data_push_cft.output_platform.cft.schemas import CftFileInfo
+    mock_flow = MagicMock()
+    file_info = CftFileInfo(name="file.txt", cft_flow=mock_flow)
+    assert file_info.cft_flow is mock_flow

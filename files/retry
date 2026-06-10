@@ -1,108 +1,74 @@
 import pytest
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
+from fastapi import HTTPException
+from pydantic import BaseModel
 
 
 # ---------------------------------------------------------------------------
-# Mock dependencies
+# Mock client & settings
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def mock_consumer():
-    consumer = MagicMock()
-    consumer.commit = MagicMock()
-    return consumer
+def mock_client():
+    client = MagicMock()
+    client.health_check = MagicMock()
+    client.transfer_file = MagicMock(return_value=MagicMock(spec=BaseModel))
+    return client
 
 
 @pytest.fixture
-def mock_producer():
-    producer = MagicMock()
-    producer.produce_event = MagicMock()
-    producer.serialize_message = MagicMock(return_value=MagicMock())
-    return producer
+def mock_client_settings_class():
+    settings_instance = MagicMock()
+    settings_class = MagicMock(return_value=settings_instance)
+    return settings_class
 
 
 @pytest.fixture
-def mock_publication():
-    pub = MagicMock()
-    pub.key = "test-key"
-    return pub
+def mock_client_class(mock_client):
+    client_class = MagicMock(return_value=mock_client)
+    return client_class
 
 
 @pytest.fixture
 def mock_file_info():
-    return [MagicMock(), MagicMock()]
+    return MagicMock(spec=BaseModel)
 
 
 @pytest.fixture
-def mock_consumer_settings_class():
-    settings_instance = MagicMock()
-    settings_class = MagicMock(return_value=settings_instance)
-    return settings_class
-
-
-@pytest.fixture
-def mock_producer_settings_class():
-    settings_instance = MagicMock()
-    settings_class = MagicMock(return_value=settings_instance)
-    return settings_class
-
-
-@pytest.fixture
-def mock_consumer_class(mock_consumer):
-    consumer_class = MagicMock(return_value=mock_consumer)
-    return consumer_class
-
-
-@pytest.fixture
-def mock_producer_class(mock_producer):
-    producer_class = MagicMock(return_value=mock_producer)
-    return producer_class
+def mock_files_info():
+    return [MagicMock(spec=BaseModel), MagicMock(spec=BaseModel)]
 
 
 # ---------------------------------------------------------------------------
-# Concrete handler fixture — bypasses __init__ to inject mocks directly
+# HTTPException helpers
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def event_handler(mock_consumer, mock_producer):
-    from data_push_cft.output_platform.base.event_handler import BaseEventHandler
-
-    class ConcreteHandler(BaseEventHandler):
-        CONSUMER_SETTING_CLASS = MagicMock()
-        PRODUCER_SETTING_CLASS = MagicMock()
-
-    with patch.object(ConcreteHandler, "__init_consumer__", return_value=mock_consumer), \
-         patch.object(ConcreteHandler, "__init_producer__", return_value=mock_producer):
-        handler = ConcreteHandler()
-        yield handler
+def http_exception_rejected():
+    """4xx — should raise RejectedException."""
+    return HTTPException(status_code=404, detail="not found")
 
 
 @pytest.fixture
-def event_handler_no_notify(mock_consumer, mock_producer):
-    """Handler with NOTIFY=False."""
-    from data_push_cft.output_platform.base.event_handler import BaseEventHandler
-
-    class ConcreteHandlerNoNotify(BaseEventHandler):
-        NOTIFY = False
-        CONSUMER_SETTING_CLASS = MagicMock()
-        PRODUCER_SETTING_CLASS = MagicMock()
-
-    with patch.object(ConcreteHandlerNoNotify, "__init_consumer__", return_value=mock_consumer), \
-         patch.object(ConcreteHandlerNoNotify, "__init_producer__", return_value=mock_producer):
-        handler = ConcreteHandlerNoNotify()
-        yield handler
+def http_exception_retryable():
+    """5xx — should raise RetryableException."""
+    return HTTPException(status_code=503, detail="service unavailable")
 
 
 @pytest.fixture
-def event_handler_no_producer(mock_consumer):
-    """Handler where __init_producer__ returns None."""
-    from data_push_cft.output_platform.base.event_handler import BaseEventHandler
+def http_exception_unknown():
+    """3xx — neither rejected nor retryable."""
+    return HTTPException(status_code=302, detail="redirect")
 
-    class ConcreteHandlerNoProducer(BaseEventHandler):
-        CONSUMER_SETTING_CLASS = MagicMock()
-        PRODUCER_SETTING_CLASS = MagicMock()
 
-    with patch.object(ConcreteHandlerNoProducer, "__init_consumer__", return_value=mock_consumer), \
-         patch.object(ConcreteHandlerNoProducer, "__init_producer__", return_value=None):
-        handler = ConcreteHandlerNoProducer()
-        yield handler
+# ---------------------------------------------------------------------------
+# BasePlatformInterface fixture — bypasses __init__ to inject mock client
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def interface(mock_client):
+    from data_push_cft.output_platform.base.interface import BasePlatformInterface
+
+    handler = BasePlatformInterface.__new__(BasePlatformInterface)
+    handler._client = mock_client
+    return handler

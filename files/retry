@@ -1,73 +1,48 @@
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 
 # ---------------------------------------------------------------------------
-# Mock COS settings
+# CftSettings
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def mock_src_cos_settings():
-    settings = MagicMock()
-    settings.COS_NAME = "src-cos"
-    return settings
-
-
-@pytest.fixture
-def mock_dest_cos_settings():
-    settings = MagicMock()
-    settings.COS_NAME = "dest-cos"
-    return settings
-
-
-@pytest.fixture
-def mock_src_cos_settings_class(mock_src_cos_settings):
-    cls = MagicMock(return_value=mock_src_cos_settings)
-    return cls
-
-
-@pytest.fixture
-def mock_dest_cos_settings_class(mock_dest_cos_settings):
-    cls = MagicMock(return_value=mock_dest_cos_settings)
-    return cls
+def cft_settings_env():
+    env = {
+        "CFT_BASE_URL": "https://cft.example.com",
+        "CFT_HVAULT_MOUNTPOINT": "/vault/mount",
+        "CFT_SECRET_PATH": "/secret/path",
+        "CFT_UESRNAME": "cft-user",
+    }
+    with patch.dict("os.environ", env, clear=False):
+        yield env
 
 
 # ---------------------------------------------------------------------------
-# Mock service
+# KafkaConsumerSettings
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def mock_service_instance():
-    return MagicMock()
-
-
-@pytest.fixture
-def mock_service_class(mock_service_instance):
-    cls = MagicMock(return_value=mock_service_instance)
-    return cls
-
-
-# ---------------------------------------------------------------------------
-# Mock publication
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def mock_publication():
-    pub = MagicMock()
-    pub.key = "test-key"
-    return pub
+def cft_kafka_consumer_env():
+    env = {
+        "KAFKA_TOPIC_PUBLIC_DATA_PUSH": "cft-topic",
+        "KAFKA_TOPIC_INTERNAL_DATA_PUSH_CFT_GROUP": "cft-group",
+    }
+    with patch.dict("os.environ", env, clear=False):
+        yield env
 
 
 # ---------------------------------------------------------------------------
-# BaseFileManager fixture — bypasses __init__ to inject mocks directly
+# PublicCosSettings
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def file_manager(mock_src_cos_settings, mock_dest_cos_settings, mock_service_instance):
-    from data_push_cft.output_platform.base.file_manager import BaseFileManager
-
-    handler = BaseFileManager.__new__(BaseFileManager)
-    handler._src_cos = mock_src_cos_settings.COS_NAME
-    handler._dest_cos = mock_dest_cos_settings.COS_NAME
-    handler._file_manager = mock_service_instance
-    return handler
+def cft_public_cos_env():
+    env = {
+        "PUBLIC_DATA_PUSH_CFT_BUCKET": "cft-bucket",
+        "PUBLIC_DATA_PUSH_CFT_BUCKET_ENDPOINT": "https://cft-cos.example.com",
+        "PUBLIC_DATA_PUSH_CFT_COS_NAME": "cft-cos",
+        "API_ETL_PROVIDER_NAME": "cft-provider",
+    }
+    with patch.dict("os.environ", env, clear=False):
+        yield env

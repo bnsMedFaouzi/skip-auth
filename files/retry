@@ -1,5 +1,5 @@
 import pytest
-from typing import Optional, Union, Type
+from typing import Optional, Type
 from data_push_cft.output_platform.base.hints import ClassHints
 
 
@@ -24,22 +24,32 @@ class UnrelatedHandler:
 # ---------------------------------------------------------------------------
 
 class HintsWithSimpleType(ClassHints):
+    """Type[BaseHandler] → __args__ = (BaseHandler,) → issubclass OK."""
     handler: Type[BaseHandler]
     handler = ConcreteHandler
 
 
 class HintsWithOptionalType(ClassHints):
-    handler: Optional[Type[BaseHandler]]
+    """Optional[BaseHandler] → __args__ = (BaseHandler, NoneType) → issubclass OK."""
+    handler: Optional[BaseHandler]
+    handler = ConcreteHandler
+
+
+class HintsWithPlainType(ClassHints):
+    """Plain BaseHandler → no __args__ → check skipped."""
+    handler: BaseHandler
     handler = ConcreteHandler
 
 
 class HintsWithNoAnnotation(ClassHints):
+    """No annotation → attr_class_types returns None → check skipped."""
     handler = ConcreteHandler
 
 
 class HintsWithWrongType(ClassHints):
-    handler: Type[BaseHandler]
-    handler = UnrelatedHandler
+    """ConcreteHandler not subclass of UnrelatedHandler → AssertionError."""
+    handler: Optional[UnrelatedHandler]
+    handler = ConcreteHandler
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +64,11 @@ def hints_simple():
 @pytest.fixture
 def hints_optional():
     return HintsWithOptionalType()
+
+
+@pytest.fixture
+def hints_plain():
+    return HintsWithPlainType()
 
 
 @pytest.fixture

@@ -1,52 +1,66 @@
 import pytest
-from unittest.mock import MagicMock, patch
+from typing import Optional, Union, Type
+from data_push_cft.output_platform.base.hints import ClassHints
 
 
-def _make_platform_mock(name: str):
-    """Helper to create a mock platform class with __PLATFORM_NAME__."""
-    mock_instance = MagicMock()
-    mock_class = MagicMock()
-    mock_class.__PLATFORM_NAME__ = name
-    mock_class.return_value = mock_instance
-    return mock_class
+# ---------------------------------------------------------------------------
+# Concrete classes used as type-checked attributes
+# ---------------------------------------------------------------------------
+
+class BaseHandler:
+    pass
+
+
+class ConcreteHandler(BaseHandler):
+    pass
+
+
+class UnrelatedHandler:
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Concrete subclasses of ClassHints for testing
+# ---------------------------------------------------------------------------
+
+class HintsWithSimpleType(ClassHints):
+    handler: Type[BaseHandler]
+    handler = ConcreteHandler
+
+
+class HintsWithOptionalType(ClassHints):
+    handler: Optional[Type[BaseHandler]]
+    handler = ConcreteHandler
+
+
+class HintsWithNoAnnotation(ClassHints):
+    handler = ConcreteHandler
+
+
+class HintsWithWrongType(ClassHints):
+    handler: Type[BaseHandler]
+    handler = UnrelatedHandler
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def hints_simple():
+    return HintsWithSimpleType()
 
 
 @pytest.fixture
-def mock_cft():
-    return _make_platform_mock("CFT")
+def hints_optional():
+    return HintsWithOptionalType()
 
 
 @pytest.fixture
-def mock_etl():
-    return _make_platform_mock("ETL")
+def hints_no_annotation():
+    return HintsWithNoAnnotation()
 
 
 @pytest.fixture
-def mock_internal():
-    return _make_platform_mock("INTERNAL")
-
-
-@pytest.fixture
-def mock_platforms(mock_cft, mock_etl, mock_internal):
-    """
-    Patches PLATFORMS list and platform_by_name dict
-    with mocked platform classes.
-    """
-    platforms = [mock_cft, mock_etl, mock_internal]
-    platform_by_name = {
-        "CFT": mock_cft,
-        "ETL": mock_etl,
-        "INTERNAL": mock_internal,
-    }
-    with patch(
-        "data_push_cft.output_platform.PLATFORMS", platforms
-    ), patch(
-        "data_push_cft.output_platform.platform_by_name", platform_by_name
-    ):
-        yield platform_by_name
-
-
-@pytest.fixture
-def platform_factory(mock_platforms):
-    from data_push_cft.output_platform import PlatformFactory
-    return PlatformFactory
+def hints_wrong_type():
+    return HintsWithWrongType()

@@ -2,35 +2,51 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 
-@pytest.fixture
-def file_transfer_client():
-    """
-    Creates a concrete subclass of FileTransferClient to test
-    the abstract methods without instantiating HttpClient directly.
-    """
-    with patch("data_push_cft.client.file_transfer.HttpClient.__init__", return_value=None):
-        from data_push_cft.client.file_transfer import FileTransferClient
-        client = FileTransferClient.__new__(FileTransferClient)
-        yield client
+def _make_platform_mock(name: str):
+    """Helper to create a mock platform class with __PLATFORM_NAME__."""
+    mock_instance = MagicMock()
+    mock_class = MagicMock()
+    mock_class.__PLATFORM_NAME__ = name
+    mock_class.return_value = mock_instance
+    return mock_class
 
 
 @pytest.fixture
-def concrete_file_transfer_client():
+def mock_cft():
+    return _make_platform_mock("CFT")
+
+
+@pytest.fixture
+def mock_etl():
+    return _make_platform_mock("ETL")
+
+
+@pytest.fixture
+def mock_internal():
+    return _make_platform_mock("INTERNAL")
+
+
+@pytest.fixture
+def mock_platforms(mock_cft, mock_etl, mock_internal):
     """
-    Concrete subclass that overrides both abstract methods —
-    used to verify subclassing works correctly.
+    Patches PLATFORMS list and platform_by_name dict
+    with mocked platform classes.
     """
-    with patch("data_push_cft.client.file_transfer.HttpClient.__init__", return_value=None):
-        from data_push_cft.client.file_transfer import FileTransferClient
-        from pydantic import BaseModel
-        from requests import Response
+    platforms = [mock_cft, mock_etl, mock_internal]
+    platform_by_name = {
+        "CFT": mock_cft,
+        "ETL": mock_etl,
+        "INTERNAL": mock_internal,
+    }
+    with patch(
+        "data_push_cft.output_platform.PLATFORMS", platforms
+    ), patch(
+        "data_push_cft.output_platform.platform_by_name", platform_by_name
+    ):
+        yield platform_by_name
 
-        class ConcreteClient(FileTransferClient):
-            def transfer_file(self, *args, **kwargs) -> BaseModel:
-                return MagicMock(spec=BaseModel)
 
-            def health_check(self) -> Response:
-                return MagicMock(spec=Response)
-
-        client = ConcreteClient.__new__(ConcreteClient)
-        yield client
+@pytest.fixture
+def platform_factory(mock_platforms):
+    from data_push_cft.output_platform import PlatformFactory
+    return PlatformFactory

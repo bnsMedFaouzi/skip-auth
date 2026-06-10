@@ -3,42 +3,25 @@ from unittest.mock import MagicMock, patch
 
 
 @pytest.fixture
-def mock_settings():
-    settings = MagicMock()
-    settings.transfer_file_uri_template = "https://cft.example.com/cft/api/v1/transfers/files/outgoings"
-    settings.health_check_uri = "https://cft.example.com/cft/api/v1/about"
-    settings.CFT_SECRET_PATH = "/secret/path"
-    settings.CFT_HVAULT_MOUNTPOINT = "/vault/mount"
-    settings.CFT_PASSWORD_KEY = "password"
-    settings.CFT_UESRNAME = "cft-user"
-    return settings
-
-
-@pytest.fixture
-def mock_hv_services():
-    secret = MagicMock()
-    secret.get_value.return_value.get_secret_value.return_value = "secret-password"
-    hv = MagicMock()
-    hv.get_secret.return_value = secret
-    return hv
+def cft_app():
+    """Bypasses __init__ to avoid all dependency initialization."""
+    from data_push_cft.output_platform.cft.application import Cft
+    app = Cft.__new__(Cft)
+    app._client = MagicMock()
+    app._consumer = MagicMock()
+    app._producer = MagicMock()
+    app._file_manager = MagicMock()
+    return app
 
 
 @pytest.fixture
 def mock_file_info():
     file_info = MagicMock()
-    file_info.path = "/some/path/file.txt"
-    file_info.pivot_filename = "file.txt"
-    file_info.cft_flow.model_dump.return_value = {"apitimeout": 30}
+    file_info.path = "bucket/subdir/file.txt"
+    file_info.model_dump.return_value = {"name": "file.txt", "path": "bucket/subdir/file.txt"}
     return file_info
 
 
 @pytest.fixture
-def cft_client(mock_settings, mock_hv_services):
-    from data_push_cft.output_platform.cft.client import CftClient
-    with patch("data_push_cft.output_platform.cft.client.HvaultSecretManager", return_value=mock_hv_services), \
-         patch("data_push_cft.output_platform.cft.client.HvaultSettings"), \
-         patch.object(CftClient, "__init__", lambda self, settings: None):
-        client = CftClient.__new__(CftClient)
-        client._settings = mock_settings
-        client._hv_services = mock_hv_services
-        yield client
+def mock_cft_flow():
+    return MagicMock()

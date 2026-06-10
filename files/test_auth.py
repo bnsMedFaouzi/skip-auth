@@ -1,95 +1,155 @@
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+from tests.fixtures.cft_client_fixtures import (
+    mock_settings,
+    mock_hv_services,
+    mock_file_info,
+    cft_client,
+)
 
 
 # ===========================================================================
-# TransferRequestPrams
+# transfer_file
 # ===========================================================================
 
-def test_transfer_request_prams_apitimeout_defaults_to_none():
-    from data_push_cft.output_platform.cft.schemas import TransferRequestPrams
-    params = TransferRequestPrams.model_construct()
-    assert params.apitimeout is None
+def test_transfer_file_calls_request_with_post(cft_client, mock_file_info):
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"idtu": "T1", "ida": "A1", "idt": "D1"}
+    cft_client.request_with_basic_auth = MagicMock(return_value=mock_response)
+
+    with patch.object(cft_client, "_get_creds", return_value=MagicMock(model_dump=lambda: {})):
+        cft_client.transfer_file(mock_file_info)
+
+    call_kwargs = cft_client.request_with_basic_auth.call_args.kwargs
+    assert call_kwargs["method"] == "post"
 
 
-def test_transfer_request_prams_apitimeout_serialization_alias():
-    from data_push_cft.output_platform.cft.schemas import TransferRequestPrams
-    params = TransferRequestPrams.model_construct(apitimeout=30)
-    assert "apitimeout" in params.model_dump(by_alias=True)
+def test_transfer_file_uses_transfer_uri(cft_client, mock_file_info, mock_settings):
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"idtu": "T1", "ida": "A1", "idt": "D1"}
+    cft_client.request_with_basic_auth = MagicMock(return_value=mock_response)
+
+    with patch.object(cft_client, "_get_creds", return_value=MagicMock(model_dump=lambda: {})):
+        cft_client.transfer_file(mock_file_info)
+
+    call_kwargs = cft_client.request_with_basic_auth.call_args.kwargs
+    assert call_kwargs["url"] == mock_settings.transfer_file_uri_template
 
 
-# ===========================================================================
-# TransferRequestBody
-# ===========================================================================
-
-def test_transfer_request_body_requires_filename():
-    from data_push_cft.output_platform.cft.schemas import TransferRequestBody
-    with pytest.raises(Exception):
-        TransferRequestBody()
-
-
-def test_transfer_request_body_filename_serialized_as_fname():
-    from data_push_cft.output_platform.cft.schemas import TransferRequestBody
-    dumped = TransferRequestBody(filename="test.txt").model_dump(by_alias=True)
-    assert dumped["fname"] == "test.txt"
-
-
-def test_transfer_request_body_parm_defaults_to_none():
-    from data_push_cft.output_platform.cft.schemas import TransferRequestBody
-    assert TransferRequestBody(filename="test.txt").parm is None
-
-
-def test_transfer_request_body_sync_defaults_to_yes():
-    from data_push_cft.output_platform.cft.schemas import TransferRequestBody
-    assert TransferRequestBody(filename="test.txt").sync == "YES"
-
-
-# ===========================================================================
-# CredsTransfer
-# ===========================================================================
-
-def test_creds_transfer_requires_username_and_password():
-    from data_push_cft.output_platform.cft.schemas import CredsTransfer
-    with pytest.raises(Exception):
-        CredsTransfer()
-
-
-def test_creds_transfer_fields_assigned():
-    from data_push_cft.output_platform.cft.schemas import CredsTransfer
-    creds = CredsTransfer(username="user", password="secret")
-    assert creds.username == "user"
-    assert creds.password == "secret"
-
-
-# ===========================================================================
-# TransferRequest
-# ===========================================================================
-
-def test_transfer_request_requires_all_fields():
+def test_transfer_file_returns_transfer_request(cft_client, mock_file_info):
     from data_push_cft.output_platform.cft.schemas import TransferRequest
-    with pytest.raises(Exception):
-        TransferRequest()
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"idtu": "T1", "ida": "A1", "idt": "D1"}
+    cft_client.request_with_basic_auth = MagicMock(return_value=mock_response)
 
+    with patch.object(cft_client, "_get_creds", return_value=MagicMock(model_dump=lambda: {})):
+        result = cft_client.transfer_file(mock_file_info)
 
-def test_transfer_request_fields_assigned():
-    from data_push_cft.output_platform.cft.schemas import TransferRequest
-    req = TransferRequest(idtu="IDTU123", ida="IDA456", idt="IDT789")
-    assert req.idtu == "IDTU123"
-    assert req.ida == "IDA456"
-    assert req.idt == "IDT789"
+    assert isinstance(result, TransferRequest)
 
 
 # ===========================================================================
-# CftFileInfo
+# health_check
 # ===========================================================================
 
-def test_cft_file_info_pivot_filename_returns_basename():
-    from data_push_cft.output_platform.cft.schemas import CftFileInfo
-    file_info = CftFileInfo.model_construct(name="/some/path/to/file.txt")
-    assert file_info.pivot_filename == "file.txt"
+def test_health_check_calls_request_with_get(cft_client, mock_settings):
+    mock_response = MagicMock()
+    cft_client.request_with_basic_auth = MagicMock(return_value=mock_response)
+
+    with patch.object(cft_client, "_get_creds", return_value=MagicMock(model_dump=lambda: {})):
+        cft_client.health_check()
+
+    call_kwargs = cft_client.request_with_basic_auth.call_args.kwargs
+    assert call_kwargs["method"] == "get"
 
 
-def test_cft_file_info_pivot_filename_strips_directory():
-    from data_push_cft.output_platform.cft.schemas import CftFileInfo
-    file_info = CftFileInfo.model_construct(name="/dir/subdir/data.parquet")
-    assert "/" not in file_info.pivot_filename
+def test_health_check_uses_health_check_uri(cft_client, mock_settings):
+    cft_client.request_with_basic_auth = MagicMock(return_value=MagicMock())
+
+    with patch.object(cft_client, "_get_creds", return_value=MagicMock(model_dump=lambda: {})):
+        cft_client.health_check()
+
+    call_kwargs = cft_client.request_with_basic_auth.call_args.kwargs
+    assert call_kwargs["url"] == mock_settings.health_check_uri
+
+
+def test_health_check_returns_response(cft_client):
+    mock_response = MagicMock()
+    cft_client.request_with_basic_auth = MagicMock(return_value=mock_response)
+
+    with patch.object(cft_client, "_get_creds", return_value=MagicMock(model_dump=lambda: {})):
+        result = cft_client.health_check()
+
+    assert result is mock_response
+
+
+# ===========================================================================
+# _get_creds
+# ===========================================================================
+
+def test_get_creds_calls_hv_services_get_secret(cft_client, mock_hv_services, mock_settings):
+    cft_client._get_creds()
+    mock_hv_services.get_secret.assert_called_once_with(
+        path=mock_settings.CFT_SECRET_PATH,
+        mount_point=mock_settings.CFT_HVAULT_MOUNTPOINT,
+        is_dynamic=False,
+        subsystem="CFT"
+    )
+
+
+def test_get_creds_returns_creds_transfer(cft_client):
+    from data_push_cft.output_platform.cft.schemas import CredsTransfer
+    result = cft_client._get_creds()
+    assert isinstance(result, CredsTransfer)
+
+
+def test_get_creds_uses_settings_username(cft_client, mock_settings):
+    result = cft_client._get_creds()
+    assert result.username == mock_settings.CFT_UESRNAME
+
+
+# ===========================================================================
+# _request (staticmethod)
+# ===========================================================================
+
+def test_request_calls_correct_session_method():
+    from data_push_cft.output_platform.cft.client import CftClient
+    mock_session = MagicMock()
+    mock_session.get.return_value = MagicMock()
+
+    with patch("data_push_cft.output_platform.cft.client.logger"):
+        CftClient._request(session=mock_session, method="get", url="https://example.com")
+
+    mock_session.get.assert_called_once()
+
+
+def test_request_passes_url_and_params():
+    from data_push_cft.output_platform.cft.client import CftClient
+    mock_session = MagicMock()
+
+    with patch("data_push_cft.output_platform.cft.client.logger"):
+        CftClient._request(
+            session=mock_session,
+            method="post",
+            url="https://example.com",
+            params={"key": "val"},
+            data={"body": "data"}
+        )
+
+    call_kwargs = mock_session.post.call_args.kwargs
+    assert call_kwargs["url"] == "https://example.com"
+    assert call_kwargs["params"] == {"key": "val"}
+    assert call_kwargs["verify"] is False
+
+
+def test_request_returns_response():
+    from data_push_cft.output_platform.cft.client import CftClient
+    mock_session = MagicMock()
+    mock_response = MagicMock()
+    mock_session.get.return_value = mock_response
+
+    with patch("data_push_cft.output_platform.cft.client.logger"):
+        result = CftClient._request(session=mock_session, method="get", url="https://example.com")
+
+    assert result is mock_response

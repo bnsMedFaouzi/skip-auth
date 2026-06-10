@@ -1,81 +1,108 @@
 import pytest
-from typing import Optional, Type
-from data_push_cft.output_platform.base.hints import ClassHints
+from unittest.mock import MagicMock, patch, PropertyMock
 
 
 # ---------------------------------------------------------------------------
-# Concrete classes used as type-checked attributes
-# ---------------------------------------------------------------------------
-
-class BaseHandler:
-    pass
-
-
-class ConcreteHandler(BaseHandler):
-    pass
-
-
-class UnrelatedHandler:
-    pass
-
-
-# ---------------------------------------------------------------------------
-# Concrete subclasses of ClassHints for testing
-# ---------------------------------------------------------------------------
-
-class HintsWithSimpleType(ClassHints):
-    """Type[BaseHandler] → __args__ = (BaseHandler,) → issubclass OK."""
-    handler: Type[BaseHandler]
-    handler = ConcreteHandler
-
-
-class HintsWithOptionalType(ClassHints):
-    """Optional[BaseHandler] → __args__ = (BaseHandler, NoneType) → issubclass OK."""
-    handler: Optional[BaseHandler]
-    handler = ConcreteHandler
-
-
-class HintsWithPlainType(ClassHints):
-    """Plain BaseHandler → no __args__ → check skipped."""
-    handler: BaseHandler
-    handler = ConcreteHandler
-
-
-class HintsWithNoAnnotation(ClassHints):
-    """No annotation → attr_class_types returns None → check skipped."""
-    handler = ConcreteHandler
-
-
-class HintsWithWrongType(ClassHints):
-    """ConcreteHandler not subclass of UnrelatedHandler → AssertionError."""
-    handler: Optional[UnrelatedHandler]
-    handler = ConcreteHandler
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
+# Mock dependencies
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def hints_simple():
-    return HintsWithSimpleType()
+def mock_consumer():
+    consumer = MagicMock()
+    consumer.commit = MagicMock()
+    return consumer
 
 
 @pytest.fixture
-def hints_optional():
-    return HintsWithOptionalType()
+def mock_producer():
+    producer = MagicMock()
+    producer.produce_event = MagicMock()
+    producer.serialize_message = MagicMock(return_value=MagicMock())
+    return producer
 
 
 @pytest.fixture
-def hints_plain():
-    return HintsWithPlainType()
+def mock_publication():
+    pub = MagicMock()
+    pub.key = "test-key"
+    return pub
 
 
 @pytest.fixture
-def hints_no_annotation():
-    return HintsWithNoAnnotation()
+def mock_file_info():
+    return [MagicMock(), MagicMock()]
 
 
 @pytest.fixture
-def hints_wrong_type():
-    return HintsWithWrongType()
+def mock_consumer_settings_class():
+    settings_instance = MagicMock()
+    settings_class = MagicMock(return_value=settings_instance)
+    return settings_class
+
+
+@pytest.fixture
+def mock_producer_settings_class():
+    settings_instance = MagicMock()
+    settings_class = MagicMock(return_value=settings_instance)
+    return settings_class
+
+
+@pytest.fixture
+def mock_consumer_class(mock_consumer):
+    consumer_class = MagicMock(return_value=mock_consumer)
+    return consumer_class
+
+
+@pytest.fixture
+def mock_producer_class(mock_producer):
+    producer_class = MagicMock(return_value=mock_producer)
+    return producer_class
+
+
+# ---------------------------------------------------------------------------
+# Concrete handler fixture — bypasses __init__ to inject mocks directly
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def event_handler(mock_consumer, mock_producer):
+    from data_push_cft.output_platform.base.event_handler import BaseEventHandler
+
+    class ConcreteHandler(BaseEventHandler):
+        CONSUMER_SETTING_CLASS = MagicMock()
+        PRODUCER_SETTING_CLASS = MagicMock()
+
+    with patch.object(ConcreteHandler, "__init_consumer__", return_value=mock_consumer), \
+         patch.object(ConcreteHandler, "__init_producer__", return_value=mock_producer):
+        handler = ConcreteHandler()
+        yield handler
+
+
+@pytest.fixture
+def event_handler_no_notify(mock_consumer, mock_producer):
+    """Handler with NOTIFY=False."""
+    from data_push_cft.output_platform.base.event_handler import BaseEventHandler
+
+    class ConcreteHandlerNoNotify(BaseEventHandler):
+        NOTIFY = False
+        CONSUMER_SETTING_CLASS = MagicMock()
+        PRODUCER_SETTING_CLASS = MagicMock()
+
+    with patch.object(ConcreteHandlerNoNotify, "__init_consumer__", return_value=mock_consumer), \
+         patch.object(ConcreteHandlerNoNotify, "__init_producer__", return_value=mock_producer):
+        handler = ConcreteHandlerNoNotify()
+        yield handler
+
+
+@pytest.fixture
+def event_handler_no_producer(mock_consumer):
+    """Handler where __init_producer__ returns None."""
+    from data_push_cft.output_platform.base.event_handler import BaseEventHandler
+
+    class ConcreteHandlerNoProducer(BaseEventHandler):
+        CONSUMER_SETTING_CLASS = MagicMock()
+        PRODUCER_SETTING_CLASS = MagicMock()
+
+    with patch.object(ConcreteHandlerNoProducer, "__init_consumer__", return_value=mock_consumer), \
+         patch.object(ConcreteHandlerNoProducer, "__init_producer__", return_value=None):
+        handler = ConcreteHandlerNoProducer()
+        yield handler

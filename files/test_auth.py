@@ -197,6 +197,7 @@ def test_serialize_public_event_with_transferred_files_still_calls_serialize(
 
 # ===========================================================================
 # __init_consumer__
+# Fix: patch _get_class_type directly to bypass issubclass() on MagicMock
 # ===========================================================================
 
 def test_init_consumer_returns_consumer_instance(
@@ -204,14 +205,15 @@ def test_init_consumer_returns_consumer_instance(
 ):
     from data_push_cft.output_platform.base.event_handler import BaseEventHandler
 
-    class ConcreteHandler(BaseEventHandler):
-        CONSUMER_CLASS = mock_consumer_class
-        CONSUMER_SETTING_CLASS = mock_consumer_settings_class
-        PRODUCER_SETTING_CLASS = MagicMock()
+    handler = BaseEventHandler.__new__(BaseEventHandler)
 
-    with patch.object(ConcreteHandler, "__init_producer__", return_value=None):
-        handler = ConcreteHandler.__new__(ConcreteHandler)
-        handler._producer = None
+    def fake_get_class_type(attr_name):
+        return {
+            "CONSUMER_SETTING_CLASS": mock_consumer_settings_class,
+            "CONSUMER_CLASS": mock_consumer_class,
+        }.get(attr_name)
+
+    with patch.object(handler, "_get_class_type", side_effect=fake_get_class_type):
         result = handler.__init_consumer__()
 
     mock_consumer_class.assert_called_once()
@@ -223,20 +225,44 @@ def test_init_consumer_instantiates_settings(
 ):
     from data_push_cft.output_platform.base.event_handler import BaseEventHandler
 
-    class ConcreteHandler(BaseEventHandler):
-        CONSUMER_CLASS = mock_consumer_class
-        CONSUMER_SETTING_CLASS = mock_consumer_settings_class
-        PRODUCER_SETTING_CLASS = MagicMock()
+    handler = BaseEventHandler.__new__(BaseEventHandler)
 
-    with patch.object(ConcreteHandler, "__init_producer__", return_value=None):
-        handler = ConcreteHandler.__new__(ConcreteHandler)
+    def fake_get_class_type(attr_name):
+        return {
+            "CONSUMER_SETTING_CLASS": mock_consumer_settings_class,
+            "CONSUMER_CLASS": mock_consumer_class,
+        }.get(attr_name)
+
+    with patch.object(handler, "_get_class_type", side_effect=fake_get_class_type):
         handler.__init_consumer__()
 
     mock_consumer_settings_class.assert_called_once()
 
 
+def test_init_consumer_passes_settings_to_consumer(
+    mock_consumer_settings_class, mock_consumer_class
+):
+    from data_push_cft.output_platform.base.event_handler import BaseEventHandler
+
+    handler = BaseEventHandler.__new__(BaseEventHandler)
+
+    def fake_get_class_type(attr_name):
+        return {
+            "CONSUMER_SETTING_CLASS": mock_consumer_settings_class,
+            "CONSUMER_CLASS": mock_consumer_class,
+        }.get(attr_name)
+
+    with patch.object(handler, "_get_class_type", side_effect=fake_get_class_type):
+        handler.__init_consumer__()
+
+    mock_consumer_class.assert_called_once_with(
+        settings=mock_consumer_settings_class.return_value
+    )
+
+
 # ===========================================================================
 # __init_producer__
+# Fix: patch _get_class_type directly to bypass issubclass() on MagicMock
 # ===========================================================================
 
 def test_init_producer_returns_producer_instance(
@@ -244,31 +270,27 @@ def test_init_producer_returns_producer_instance(
 ):
     from data_push_cft.output_platform.base.event_handler import BaseEventHandler
 
-    class ConcreteHandler(BaseEventHandler):
-        PRODUCER_CLASS = mock_producer_class
-        PRODUCER_SETTING_CLASS = mock_producer_settings_class
-        CONSUMER_SETTING_CLASS = MagicMock()
+    handler = BaseEventHandler.__new__(BaseEventHandler)
 
-    with patch.object(ConcreteHandler, "__init_consumer__", return_value=MagicMock()):
-        handler = ConcreteHandler.__new__(ConcreteHandler)
+    def fake_get_class_type(attr_name):
+        return {
+            "PRODUCER_CLASS": mock_producer_class,
+            "PRODUCER_SETTING_CLASS": mock_producer_settings_class,
+        }.get(attr_name)
+
+    with patch.object(handler, "_get_class_type", side_effect=fake_get_class_type):
         result = handler.__init_producer__()
 
     mock_producer_class.assert_called_once()
     assert result is mock_producer_class.return_value
 
 
-def test_init_producer_returns_none_when_producer_class_is_none(
-    mock_producer_settings_class
-):
+def test_init_producer_returns_none_when_producer_class_is_none():
     from data_push_cft.output_platform.base.event_handler import BaseEventHandler
 
-    class ConcreteHandlerNoProd(BaseEventHandler):
-        PRODUCER_CLASS = None
-        PRODUCER_SETTING_CLASS = mock_producer_settings_class
-        CONSUMER_SETTING_CLASS = MagicMock()
+    handler = BaseEventHandler.__new__(BaseEventHandler)
 
-    with patch.object(ConcreteHandlerNoProd, "__init_consumer__", return_value=MagicMock()):
-        handler = ConcreteHandlerNoProd.__new__(ConcreteHandlerNoProd)
+    with patch.object(handler, "_get_class_type", return_value=None):
         result = handler.__init_producer__()
 
     assert result is None
@@ -279,13 +301,36 @@ def test_init_producer_instantiates_settings(
 ):
     from data_push_cft.output_platform.base.event_handler import BaseEventHandler
 
-    class ConcreteHandler(BaseEventHandler):
-        PRODUCER_CLASS = mock_producer_class
-        PRODUCER_SETTING_CLASS = mock_producer_settings_class
-        CONSUMER_SETTING_CLASS = MagicMock()
+    handler = BaseEventHandler.__new__(BaseEventHandler)
 
-    with patch.object(ConcreteHandler, "__init_consumer__", return_value=MagicMock()):
-        handler = ConcreteHandler.__new__(ConcreteHandler)
+    def fake_get_class_type(attr_name):
+        return {
+            "PRODUCER_CLASS": mock_producer_class,
+            "PRODUCER_SETTING_CLASS": mock_producer_settings_class,
+        }.get(attr_name)
+
+    with patch.object(handler, "_get_class_type", side_effect=fake_get_class_type):
         handler.__init_producer__()
 
     mock_producer_settings_class.assert_called_once()
+
+
+def test_init_producer_passes_settings_to_producer(
+    mock_producer_settings_class, mock_producer_class
+):
+    from data_push_cft.output_platform.base.event_handler import BaseEventHandler
+
+    handler = BaseEventHandler.__new__(BaseEventHandler)
+
+    def fake_get_class_type(attr_name):
+        return {
+            "PRODUCER_CLASS": mock_producer_class,
+            "PRODUCER_SETTING_CLASS": mock_producer_settings_class,
+        }.get(attr_name)
+
+    with patch.object(handler, "_get_class_type", side_effect=fake_get_class_type):
+        handler.__init_producer__()
+
+    mock_producer_class.assert_called_once_with(
+        kafka_settings=mock_producer_settings_class.return_value
+    )

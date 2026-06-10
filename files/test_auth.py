@@ -118,14 +118,14 @@ def test_upload_files_is_callable(file_manager):
     assert callable(file_manager.upload_files)
 
 
-def test_upload_files_returns_none_when_not_implemented(file_manager, mock_publication):
-    result = file_manager.upload_files(publication=mock_publication)
-    assert result is None
+def test_upload_files_calls_service(file_manager, mock_publication, mock_service_instance):
+    file_manager.upload_files(publication=mock_publication)
+    mock_service_instance.copy_publications_files.assert_called_once()
 
 
 def test_upload_files_accepts_prefix_argument(file_manager, mock_publication):
-    result = file_manager.upload_files(publication=mock_publication, prefix="2024/01")
-    assert result is None
+    # Should not raise when prefix is provided
+    file_manager.upload_files(publication=mock_publication, prefix="2024/01")
 
 
 def test_upload_files_prefix_defaults_to_none(file_manager, mock_publication):

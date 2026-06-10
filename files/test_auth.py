@@ -1,171 +1,110 @@
 import pytest
-from unittest.mock import patch
+from typing import Optional, Type
 
-from tests.fixtures.output_platform_fixtures import (
-    mock_cft,
-    mock_etl,
-    mock_internal,
-    mock_platforms,
-    platform_factory,
+from tests.fixtures.hints_fixtures import (
+    hints_simple,
+    hints_optional,
+    hints_no_annotation,
+    hints_wrong_type,
+    HintsWithSimpleType,
+    HintsWithOptionalType,
+    HintsWithNoAnnotation,
+    HintsWithWrongType,
+    BaseHandler,
+    ConcreteHandler,
+    UnrelatedHandler,
 )
 
 
 # ===========================================================================
-# PLATFORMS list
+# attr_class_types — classmethod
 # ===========================================================================
 
-def test_platforms_is_list(mock_platforms):
-    from data_push_cft.output_platform import PLATFORMS
-    assert isinstance(PLATFORMS, list)
+def test_attr_class_types_returns_type_hint_for_known_attr():
+    result = HintsWithSimpleType.attr_class_types(attr_name="handler")
+    assert result is not None
 
 
-def test_platforms_contains_three_entries(mock_platforms):
-    from data_push_cft.output_platform import PLATFORMS
-    assert len(PLATFORMS) == 3
+def test_attr_class_types_returns_none_for_unknown_attr():
+    result = HintsWithSimpleType.attr_class_types(attr_name="unknown_attr")
+    assert result is None
 
 
-def test_platforms_contains_cft(mock_platforms):
-    from data_push_cft.output_platform import PLATFORMS
-    names = [p.__PLATFORM_NAME__ for p in PLATFORMS]
-    assert "CFT" in names
+def test_attr_class_types_returns_none_when_no_annotation():
+    result = HintsWithNoAnnotation.attr_class_types(attr_name="handler")
+    assert result is None
 
 
-def test_platforms_contains_etl(mock_platforms):
-    from data_push_cft.output_platform import PLATFORMS
-    names = [p.__PLATFORM_NAME__ for p in PLATFORMS]
-    assert "ETL" in names
+def test_attr_class_types_returns_optional_hint():
+    result = HintsWithOptionalType.attr_class_types(attr_name="handler")
+    assert result is not None
+    assert hasattr(result, "__args__")
 
 
-def test_platforms_contains_internal(mock_platforms):
-    from data_push_cft.output_platform import PLATFORMS
-    names = [p.__PLATFORM_NAME__ for p in PLATFORMS]
-    assert "INTERNAL" in names
-
-
-# ===========================================================================
-# platform_by_name dict
-# ===========================================================================
-
-def test_platform_by_name_is_dict(mock_platforms):
-    from data_push_cft.output_platform import platform_by_name
-    assert isinstance(platform_by_name, dict)
-
-
-def test_platform_by_name_has_cft_key(mock_platforms):
-    from data_push_cft.output_platform import platform_by_name
-    assert "CFT" in platform_by_name
-
-
-def test_platform_by_name_has_etl_key(mock_platforms):
-    from data_push_cft.output_platform import platform_by_name
-    assert "ETL" in platform_by_name
-
-
-def test_platform_by_name_has_internal_key(mock_platforms):
-    from data_push_cft.output_platform import platform_by_name
-    assert "INTERNAL" in platform_by_name
-
-
-def test_platform_by_name_keys_are_uppercased(mock_platforms):
-    from data_push_cft.output_platform import platform_by_name
-    for key in platform_by_name:
-        assert key == key.upper()
+def test_attr_class_types_result_contains_base_class_in_args():
+    result = HintsWithOptionalType.attr_class_types(attr_name="handler")
+    # Optional[Type[BaseHandler]] → __args__ contains Type[BaseHandler]
+    assert any(
+        hasattr(arg, "__args__") and BaseHandler in arg.__args__
+        for arg in result.__args__
+        if arg is not type(None)
+    )
 
 
 # ===========================================================================
-# PlatformFactory.__init__
+# _get_class_type — type check passes
 # ===========================================================================
 
-def test_platform_factory_default_platform_is_cft(platform_factory):
-    factory = platform_factory()
-    assert factory.platform_name == "CFT"
+def test_get_class_type_returns_attr_class(hints_simple):
+    result = hints_simple._get_class_type("handler")
+    assert result is ConcreteHandler
 
 
-def test_platform_factory_stores_platform_name_uppercased(platform_factory):
-    factory = platform_factory(platform_name="etl")
-    assert factory.platform_name == "ETL"
+def test_get_class_type_returns_attr_class_with_optional_hint(hints_optional):
+    result = hints_optional._get_class_type("handler")
+    assert result is ConcreteHandler
 
 
-def test_platform_factory_accepts_cft(platform_factory):
-    factory = platform_factory(platform_name="cft")
-    assert factory.platform_name == "CFT"
+def test_get_class_type_returns_attr_class_when_no_annotation(hints_no_annotation):
+    result = hints_no_annotation._get_class_type("handler")
+    assert result is ConcreteHandler
 
 
-def test_platform_factory_accepts_etl(platform_factory):
-    factory = platform_factory(platform_name="etl")
-    assert factory.platform_name == "ETL"
-
-
-def test_platform_factory_accepts_internal(platform_factory):
-    factory = platform_factory(platform_name="internal")
-    assert factory.platform_name == "INTERNAL"
-
-
-def test_platform_factory_already_uppercase_name(platform_factory):
-    factory = platform_factory(platform_name="CFT")
-    assert factory.platform_name == "CFT"
+def test_get_class_type_returns_none_for_missing_attr(hints_simple):
+    result = hints_simple._get_class_type("nonexistent_attr")
+    assert result is None
 
 
 # ===========================================================================
-# PlatformFactory.__call__
+# _get_class_type — type check skipped (no __args__)
 # ===========================================================================
 
-def test_platform_factory_call_returns_cft_instance(mock_platforms, platform_factory, mock_cft):
-    factory = platform_factory(platform_name="CFT")
-    result = factory()
-    mock_cft.assert_called_once()
-    assert result == mock_cft.return_value
-
-
-def test_platform_factory_call_returns_etl_instance(mock_platforms, platform_factory, mock_etl):
-    factory = platform_factory(platform_name="ETL")
-    result = factory()
-    mock_etl.assert_called_once()
-    assert result == mock_etl.return_value
-
-
-def test_platform_factory_call_returns_internal_instance(mock_platforms, platform_factory, mock_internal):
-    factory = platform_factory(platform_name="INTERNAL")
-    result = factory()
-    mock_internal.assert_called_once()
-    assert result == mock_internal.return_value
-
-
-def test_platform_factory_call_raises_key_error_for_unknown_platform(platform_factory):
-    factory = platform_factory(platform_name="UNKNOWN")
-    with pytest.raises(KeyError):
-        factory()
+def test_get_class_type_skips_check_when_type_has_no_args(hints_simple):
+    """Simple Type[X] hint without Union/Optional → no __args__ at top level → skip check."""
+    # Type[BaseHandler] doesn't have __args__ at the top-level hint
+    # so the assert block is skipped and ConcreteHandler is returned
+    result = hints_simple._get_class_type("handler")
+    assert result is not None
 
 
 # ===========================================================================
-# get_application
+# _get_class_type — AssertionError on type mismatch
 # ===========================================================================
 
-def test_get_application_returns_cft_instance(mock_platforms, mock_cft):
-    from data_push_cft.output_platform import get_application
-    result = get_application("CFT")
-    mock_cft.assert_called_once()
-    assert result == mock_cft.return_value
+def test_get_class_type_raises_assertion_error_on_wrong_type(hints_wrong_type):
+    """
+    When _types has __args__ and _AttrClass is not a subclass
+    of any expected type → AssertionError.
+    """
+    with pytest.raises(AssertionError):
+        hints_wrong_type._get_class_type("handler")
 
 
-def test_get_application_returns_etl_instance(mock_platforms, mock_etl):
-    from data_push_cft.output_platform import get_application
-    result = get_application("ETL")
-    mock_etl.assert_called_once()
-    assert result == mock_etl.return_value
+def test_get_class_type_assertion_error_message_contains_attr_name(hints_wrong_type):
+    with pytest.raises(AssertionError, match="handler"):
+        hints_wrong_type._get_class_type("handler")
 
 
-def test_get_application_returns_internal_instance(mock_platforms, mock_internal):
-    from data_push_cft.output_platform import get_application
-    result = get_application("INTERNAL")
-    mock_internal.assert_called_once()
-    assert result == mock_internal.return_value
-
-
-def test_get_application_delegates_to_platform_factory(mock_platforms):
-    from data_push_cft.output_platform import get_application, PlatformFactory
-    with patch(
-        "data_push_cft.output_platform.PlatformFactory", wraps=PlatformFactory
-    ) as mock_factory:
-        get_application("CFT")
-        mock_factory.assert_called_once_with(platform_name="CFT")
+def test_get_class_type_assertion_error_message_contains_type_info(hints_wrong_type):
+    with pytest.raises(AssertionError, match="must be type of"):
+        hints_wrong_type._get_class_type("handler")

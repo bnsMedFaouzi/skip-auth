@@ -1,21 +1,32 @@
 import pytest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 @pytest.fixture
-def internal_kafka_env():
-    env = {
-        "KAFKA_TOPIC_INTERNAL_DATA_PULL": "internal-topic",
-        "KAFKA_TOPIC_INTERNAL_DATA_PULL_GROUP": "internal-group",
-    }
-    with patch.dict("os.environ", env, clear=False):
-        yield env
+def internal_app():
+    """Bypasses __init__ to avoid all dependency initialization."""
+    from data_push_cft.output_platform.internal.application import Internal
+    app = Internal.__new__(Internal)
+    app._client = MagicMock()
+    app._consumer = MagicMock()
+    app._services = MagicMock()
+    return app
 
 
 @pytest.fixture
-def internal_publisher_settings_env():
-    env = {
-        "BASE_URL": "https://publisher.example.com",
+def mock_publication():
+    pub = MagicMock()
+    pub.idf = "IDF1"
+    pub.part = "PART1"
+    pub.filename = "file.txt"
+    return pub
+
+
+@pytest.fixture
+def mock_mapped_metadata():
+    metadata = MagicMock()
+    metadata.model_dump.return_value = {
+        "metadata": MagicMock(),
+        "publication_type": MagicMock(),
     }
-    with patch.dict("os.environ", env, clear=False):
-        yield env
+    return metadata

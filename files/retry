@@ -1,26 +1,21 @@
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 
 @pytest.fixture
-def mock_settings():
-    settings = MagicMock()
-    settings.get_push_uri_template = "https://publisher.example.com/api/push"
-    settings.health_check_uri = "https://publisher.example.com/health"
-    return settings
+def internal_kafka_env():
+    env = {
+        "KAFKA_TOPIC_INTERNAL_DATA_PULL": "internal-topic",
+        "KAFKA_TOPIC_INTERNAL_DATA_PULL_GROUP": "internal-group",
+    }
+    with patch.dict("os.environ", env, clear=False):
+        yield env
 
 
 @pytest.fixture
-def mock_file_info():
-    file_info = MagicMock()
-    file_info.model_dump_json.return_value = '{"filename": "test.txt"}'
-    return file_info
-
-
-@pytest.fixture
-def publisher_client(mock_settings):
-    from data_push_cft.output_platform.internal.clients.publisher import ApiPublisherClient
-    client = ApiPublisherClient.__new__(ApiPublisherClient)
-    client._settings = mock_settings
-    client.request_with_token = MagicMock(return_value=MagicMock())
-    return client
+def internal_publisher_settings_env():
+    env = {
+        "BASE_URL": "https://publisher.example.com",
+    }
+    with patch.dict("os.environ", env, clear=False):
+        yield env

@@ -24,7 +24,3 @@ def publisher_client(mock_settings):
     client._settings = mock_settings
     client.request_with_token = MagicMock(return_value=MagicMock())
     return client
-        mock_super.return_value.upload_files.return_value = []
-        result = cft_app.upload_files(publication=mock_publication)
- 
-    assert len(result) == 2

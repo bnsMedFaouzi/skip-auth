@@ -1,85 +1,78 @@
 import pytest
-from unittest.mock import patch
-
-from tests.fixtures.internal_settings_fixtures import (
-    internal_kafka_env,
-    internal_publisher_settings_env,
-)
 
 
 # ===========================================================================
-# KafkaConsumerSettings
+# ProviderSource
 # ===========================================================================
 
-def test_internal_kafka_topic_name_loaded_from_env(internal_kafka_env):
-    from data_push_cft.output_platform.internal.settings import KafkaConsumerSettings
-    settings = KafkaConsumerSettings()
-    assert settings.TOPIC_NAME == "internal-topic"
+def test_provider_source_requires_all_fields():
+    from data_push_cft.output_platform.internal.schemas.publication import ProviderSource
+    with pytest.raises(Exception):
+        ProviderSource()
 
 
-def test_internal_kafka_group_name_loaded_from_env(internal_kafka_env):
-    from data_push_cft.output_platform.internal.settings import KafkaConsumerSettings
-    settings = KafkaConsumerSettings()
-    assert settings.GROUP_NAME == "internal-group"
-
-
-def test_internal_kafka_group_name_serialization_alias(internal_kafka_env):
-    from data_push_cft.output_platform.internal.settings import KafkaConsumerSettings
-    settings = KafkaConsumerSettings()
-    dumped = settings.model_dump(by_alias=True)
-    assert "group.id" in dumped
-    assert dumped["group.id"] == "internal-group"
+def test_provider_source_fields_assigned():
+    from data_push_cft.output_platform.internal.schemas.publication import ProviderSource
+    ps = ProviderSource(idf="IDF1", part="PART1", cftname="CFT1")
+    assert ps.idf == "IDF1"
+    assert ps.part == "PART1"
+    assert ps.cftname == "CFT1"
 
 
 # ===========================================================================
-# ApiPublisherSettings — default values
+# EventFromCft
 # ===========================================================================
 
-def test_api_publisher_default_get_metadata_uri(internal_publisher_settings_env):
-    from data_push_cft.output_platform.internal.settings import ApiPublisherSettings
-    settings = ApiPublisherSettings()
-    assert settings.GET_METADATA_URI == "/v1/publisher_service/publication/push"
+def _valid_event(**kwargs):
+    from data_push_cft.output_platform.internal.schemas.publication import (
+        EventFromCft, ProviderSource
+    )
+    defaults = {
+        "filename": "test.txt",
+        "provider_source": ProviderSource(idf="IDF1", part="PART1", cftname="CFT1"),
+        "bucket_name": "my-bucket",
+        "bucket_endpoint": "https://cos.example.com",
+        "ecosystem": "prod",
+    }
+    defaults.update(kwargs)
+    return EventFromCft(**defaults)
 
 
-def test_api_publisher_default_health_check_uri_field(internal_publisher_settings_env):
-    from data_push_cft.output_platform.internal.settings import ApiPublisherSettings
-    settings = ApiPublisherSettings()
-    assert settings.HEALTH_CHECK_URI == "/v1/publisher_service/health_check"
+def test_event_from_cft_requires_all_fields():
+    from data_push_cft.output_platform.internal.schemas.publication import EventFromCft
+    with pytest.raises(Exception):
+        EventFromCft()
 
 
-def test_api_publisher_get_metadata_uri_can_be_overridden(internal_publisher_settings_env):
-    from data_push_cft.output_platform.internal.settings import ApiPublisherSettings
-    with patch.dict("os.environ", {"API_PUBLISHER_PUSH_URI": "/custom/push"}):
-        settings = ApiPublisherSettings()
-    assert settings.GET_METADATA_URI == "/custom/push"
+def test_event_from_cft_filename_min_length_one():
+    with pytest.raises(Exception):
+        _valid_event(filename="")
 
 
-# ===========================================================================
-# ApiPublisherSettings — computed properties
-# ===========================================================================
-
-def test_get_push_uri_template_concatenates_base_url_and_uri(internal_publisher_settings_env):
-    from data_push_cft.output_platform.internal.settings import ApiPublisherSettings
-    settings = ApiPublisherSettings()
-    assert settings.get_push_uri_template == f"{settings.BASE_URL}{settings.GET_METADATA_URI}"
+def test_event_from_cft_origin_defaults_to_none():
+    event = _valid_event()
+    assert event.origin is None
 
 
-def test_get_push_uri_template_starts_with_base_url(internal_publisher_settings_env):
-    from data_push_cft.output_platform.internal.settings import ApiPublisherSettings
-    settings = ApiPublisherSettings()
-    assert settings.get_push_uri_template.startswith("https://publisher.example.com")
+def test_event_from_cft_origin_accepts_dict():
+    event = _valid_event(origin={"key": "value"})
+    assert event.origin == {"key": "value"}
 
 
-def test_health_check_uri_concatenates_base_url_and_uri(internal_publisher_settings_env):
-    from data_push_cft.output_platform.internal.settings import ApiPublisherSettings
-    settings = ApiPublisherSettings()
-    assert settings.health_check_uri == f"{settings.BASE_URL}{settings.HEALTH_CHECK_URI}"
+def test_event_from_cft_bucket_endpoint_is_validated_url():
+    with pytest.raises(Exception):
+        _valid_event(bucket_endpoint="not-a-url")
 
 
-def test_health_check_uri_starts_with_base_url(internal_publisher_settings_env):
-    from data_push_cft.output_platform.internal.settings import ApiPublisherSettings
-    settings = ApiPublisherSettings()
-    assert settings.health_check_uri.startswith("https://publisher.example.com")
-    publisher_client.transfer_file(mock_file_info)
-    call_kwargs = publisher_client.request_with_token.call_args.kwargs
-    assert call_kwargs["url"] == mock_settings.get_push_uri_template
+def test_event_from_cft_fields_assigned():
+    event = _valid_event()
+    assert event.filename == "test.txt"
+    assert event.bucket_name == "my-bucket"
+    assert event.ecosystem == "prod"
+
+
+def test_event_from_cft_provider_source_assigned():
+    from data_push_cft.output_platform.internal.schemas.publication import ProviderSource
+    ps = ProviderSource(idf="IDF1", part="PART1", cftname="CFT1")
+    event = _valid_event(provider_source=ps)
+    assert event.provider_source is ps

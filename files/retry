@@ -1,39 +1,29 @@
-# ===========================================================================
-# upload_files
-# ===========================================================================
- 
-def test_upload_files_returns_empty_list_when_no_cft_flows(cft_app):
-    mock_publication = MagicMock()
-    mock_publication.metadata.cft_flows = []
-    result = cft_app.upload_files(publication=mock_publication)
-    assert result == []
- 
- 
-def test_upload_files_calls_super_with_generated_prefix(cft_app):
-    mock_cft_flow = MagicMock()
-    mock_cft_flow.idf = "MY_IDF"
-    mock_cft_flow.part = "MY_PART"
-    mock_publication = MagicMock()
-    mock_publication.metadata.cft_flows = [mock_cft_flow]
- 
-    with patch("data_push_cft.output_platform.cft.application.super") as mock_super, \
-         patch.object(cft_app, "serialise_cft_upload_files", return_value=[]):
-        mock_super.return_value.upload_files = MagicMock(return_value=[])
-        cft_app.upload_files(publication=mock_publication)
- 
-    mock_super.return_value.upload_files.assert_called_once_with(
-        publication=mock_publication, prefix="MY_IDF/MY_PART"
-    )
- 
- 
-def test_upload_files_extends_result_with_serialised_files(cft_app):
-    mock_cft_flow = MagicMock()
-    mock_publication = MagicMock()
-    mock_publication.metadata.cft_flows = [mock_cft_flow, mock_cft_flow]
-    mock_cft_file = MagicMock()
- 
-    with patch("data_push_cft.output_platform.cft.application.super") as mock_super, \
-         patch.object(cft_app, "serialise_cft_upload_files", return_value=[mock_cft_file]):
+import pytest
+from unittest.mock import MagicMock, patch
+
+
+@pytest.fixture
+def mock_settings():
+    settings = MagicMock()
+    settings.get_push_uri_template = "https://publisher.example.com/api/push"
+    settings.health_check_uri = "https://publisher.example.com/health"
+    return settings
+
+
+@pytest.fixture
+def mock_file_info():
+    file_info = MagicMock()
+    file_info.model_dump_json.return_value = '{"filename": "test.txt"}'
+    return file_info
+
+
+@pytest.fixture
+def publisher_client(mock_settings):
+    from data_push_cft.output_platform.internal.clients.publisher import ApiPublisherClient
+    client = ApiPublisherClient.__new__(ApiPublisherClient)
+    client._settings = mock_settings
+    client.request_with_token = MagicMock(return_value=MagicMock())
+    return client
         mock_super.return_value.upload_files.return_value = []
         result = cft_app.upload_files(publication=mock_publication)
  

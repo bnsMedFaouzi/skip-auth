@@ -1,116 +1,138 @@
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+from fastapi import HTTPException
+
+from tests.fixtures.internal_application_fixtures import (
+    internal_app,
+    mock_publication,
+    mock_mapped_metadata,
+)
 
 
 # ===========================================================================
-# Helpers
+# Class attributes
 # ===========================================================================
 
-def _valid_file_location(**kwargs):
-    from data_push_cft.output_platform.internal.schemas.publisher import FileLocation
-    defaults = {
-        "bucket_name": "my-bucket",
-        "bucket_endpoint": "https://cos.example.com",
-        "cos": "my-cos",
-        "ecosystem": "prod",
-    }
-    defaults.update(kwargs)
-    return FileLocation.model_validate(defaults)
+def test_platform_name_is_internal():
+    from data_push_cft.output_platform.internal.application import Internal
+    assert Internal.__PLATFORM_NAME__ == "INTERNAL"
 
 
-def _valid_publisher_request_body(**kwargs):
-    from data_push_cft.output_platform.internal.schemas.publisher import (
-        PublisherRequestBody, Metadata
+def test_notify_is_false():
+    from data_push_cft.output_platform.internal.application import Internal
+    assert Internal.NOTIFY is False
+
+
+def test_platform_client_class_is_api_publisher_client():
+    from data_push_cft.output_platform.internal.application import Internal
+    from data_push_cft.output_platform.internal.clients.publisher import ApiPublisherClient
+    assert Internal.PLATFORM_CLIENT_CLASS is ApiPublisherClient
+
+
+def test_consumer_setting_class_is_kafka_consumer_settings():
+    from data_push_cft.output_platform.internal.application import Internal
+    from data_push_cft.output_platform.internal.settings import KafkaConsumerSettings
+    assert Internal.CONSUMER_SETTING_CLASS is KafkaConsumerSettings
+
+
+# ===========================================================================
+# services property
+# ===========================================================================
+
+def test_services_property_returns_services(internal_app):
+    assert internal_app.services is internal_app._services
+
+
+# ===========================================================================
+# _resolve_action
+# ===========================================================================
+
+def test_resolve_action_always_raises_retryable_exception(internal_app):
+    from data_push_cft.output_platform.exceptiones import RetryableException
+    with pytest.raises(RetryableException):
+        internal_app._resolve_action(HTTPException(status_code=400))
+
+
+def test_resolve_action_raises_for_any_status_code(internal_app):
+    from data_push_cft.output_platform.exceptiones import RetryableException
+    for status_code in [400, 404, 500, 503]:
+        with pytest.raises(RetryableException):
+            internal_app._resolve_action(HTTPException(status_code=status_code))
+
+
+# ===========================================================================
+# upload_files
+# ===========================================================================
+
+def test_upload_files_returns_list(internal_app, mock_publication, mock_mapped_metadata):
+    with patch.object(
+        internal_app, "_manager_get_cft_metadata_mapping", return_value=mock_mapped_metadata
+    ), patch(
+        "data_push_cft.output_platform.internal.application.FileLocation"
+    ) as mock_fl, patch(
+        "data_push_cft.output_platform.internal.application.PublisherRequestBody"
+    ) as mock_prb:
+        mock_fl.model_validate.return_value = MagicMock()
+        mock_prb.model_validate.return_value = MagicMock()
+        result = internal_app.upload_files(mock_publication)
+
+    assert isinstance(result, list)
+    assert len(result) == 1
+
+
+def test_upload_files_calls_manager_get_cft_metadata_mapping(
+    internal_app, mock_publication, mock_mapped_metadata
+):
+    with patch.object(
+        internal_app, "_manager_get_cft_metadata_mapping", return_value=mock_mapped_metadata
+    ) as mock_manager, patch(
+        "data_push_cft.output_platform.internal.application.FileLocation"
+    ) as mock_fl, patch(
+        "data_push_cft.output_platform.internal.application.PublisherRequestBody"
+    ) as mock_prb:
+        mock_fl.model_validate.return_value = MagicMock()
+        mock_prb.model_validate.return_value = MagicMock()
+        internal_app.upload_files(mock_publication)
+
+    mock_manager.assert_called_once_with(
+        idf=mock_publication.idf,
+        part=mock_publication.part,
+        filename=mock_publication.filename
     )
-    metadata = Metadata.model_construct(
-        pivots=[MagicMock()],
-        metadata_filename="meta.json"
+
+
+# ===========================================================================
+# _manager_get_cft_metadata_mapping
+# ===========================================================================
+
+def test_manager_get_cft_metadata_mapping_calls_services(internal_app):
+    mock_response = MagicMock()
+    internal_app._services.get_cft_metadata_mapping.return_value = mock_response
+
+    result = internal_app._manager_get_cft_metadata_mapping(
+        idf="IDF1", part="PART1", filename="file.txt"
     )
-    defaults = {
-        "metadata": metadata,
-        "publication_type": MagicMock(),
-        "file_location": _valid_file_location(),
-    }
-    defaults.update(kwargs)
-    return PublisherRequestBody(**defaults)
+
+    internal_app._services.get_cft_metadata_mapping.assert_called_once_with(
+        idf="IDF1", part="PART1", filename="file.txt"
+    )
+    assert result is mock_response
+
+
+def test_manager_get_cft_metadata_mapping_calls_resolve_on_http_exception(internal_app):
+    internal_app._services.get_cft_metadata_mapping.side_effect = HTTPException(status_code=503)
+
+    from data_push_cft.output_platform.exceptiones import RetryableException
+    with pytest.raises(RetryableException):
+        internal_app._manager_get_cft_metadata_mapping(
+            idf="IDF1", part="PART1", filename="file.txt"
+        )
 
 
 # ===========================================================================
-# FileLocation
+# __init_producer__
 # ===========================================================================
 
-def test_file_location_requires_all_fields():
-    from data_push_cft.output_platform.internal.schemas.publisher import FileLocation
-    with pytest.raises(Exception):
-        FileLocation()
-
-
-def test_file_location_bucket_alias():
-    loc = _valid_file_location()
-    assert loc.bucket == "my-bucket"
-
-
-def test_file_location_endpoint_alias():
-    loc = _valid_file_location()
-    assert "cos.example.com" in str(loc.endpoint)
-
-
-def test_file_location_endpoint_validates_url():
-    with pytest.raises(Exception):
-        _valid_file_location(bucket_endpoint="not-a-url")
-
-
-def test_file_location_cos_and_ecosystem_assigned():
-    loc = _valid_file_location()
-    assert loc.cos == "my-cos"
-    assert loc.ecosystem == "prod"
-
-
-# ===========================================================================
-# Metadata
-# ===========================================================================
-
-def test_metadata_requires_pivots_and_filename():
-    from data_push_cft.output_platform.internal.schemas.publisher import Metadata
-    with pytest.raises(Exception):
-        Metadata()
-
-
-def test_metadata_pivots_min_length_one():
-    from data_push_cft.output_platform.internal.schemas.publisher import Metadata
-    with pytest.raises(Exception):
-        Metadata.model_validate({"pivots": [], "metadata_filename": "meta.json"})
-
-
-def test_metadata_fields_assigned():
-    from data_push_cft.output_platform.internal.schemas.publisher import Metadata
-    mock_pivot = MagicMock()
-    m = Metadata.model_construct(pivots=[mock_pivot], metadata_filename="meta.json")
-    assert m.metadata_filename == "meta.json"
-    assert len(m.pivots) == 1
-
-
-# ===========================================================================
-# PublisherRequestBody
-# ===========================================================================
-
-def test_publisher_request_body_requires_all_fields():
-    from data_push_cft.output_platform.internal.schemas.publisher import PublisherRequestBody
-    with pytest.raises(Exception):
-        PublisherRequestBody()
-
-
-def test_publisher_request_body_is_deleted_defaults_to_false():
-    body = _valid_publisher_request_body()
-    assert body.is_deleted is False
-
-
-def test_publisher_request_body_is_deleted_can_be_true():
-    body = _valid_publisher_request_body(is_deleted=True)
-    assert body.is_deleted is True
-
-
-def test_publisher_request_body_fields_assigned():
-    loc = _valid_file_location()
-    body = _valid_publisher_request_body(file_location=loc)
-    assert body.file_location is loc
+def test_init_producer_returns_none(internal_app):
+    result = internal_app.__init_producer__()
+    assert result is None

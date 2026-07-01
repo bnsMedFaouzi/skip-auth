@@ -201,11 +201,17 @@ Objet structuré en mémoire, lisible, orienté « pourquoi le fichier est inval
 - `stopped_at_phase` (optionnel) : phase où le gate a bloqué, le cas échéant.
 - `summary` : compteurs globaux (nb d'erreurs, nb par sévérité, nb de lignes
   contrôlées, nb de lignes en erreur).
+- `diagnostic` : synthèse config-vs-données en tête de rapport (voir section 4.5) —
+  agrège les signaux de toutes les règles pour indiquer, au premier coup d'œil, si
+  l'échec ressemble à un problème de configuration ou à un fichier réellement invalide.
 - `results` : liste de résultats par règle, chacun avec :
   - `rule_id`, `name`, `scope`, `severity`, `dimension`, `phase`
   - `passed` : booléen (calculé sur les erreurs **non exemptées** uniquement)
   - `error_count` : erreurs réelles (comptent, peuvent bloquer)
   - `waived_count` : erreurs sur colonnes exemptées (tracées, neutralisées)
+  - `failure_rate` : part des cellules/lignes contrôlées en échec (0.0 à 1.0)
+  - `diagnostic_hint` : indice config-vs-données hiérarchisé par confiance
+    (`LIKELY_CONFIG`, `LIKELY_DATA`, `INCONCLUSIVE`) — voir section 4.5
   - `errors` : échantillon détaillé et **borné** (voir ci-dessous) — colonne, n° de
     ligne le cas échéant, valeur fautive, message expliquant l'attendu vs le constaté,
     et un statut (`ERROR` ou `WAIVED`).
@@ -247,6 +253,45 @@ Comportement :
 > bien exécuté sur les colonnes exemptées (pas d'économie de calcul), contrairement à
 > un mode « non testé » qui les sortirait du périmètre. C'est le prix de la
 > traçabilité demandée.
+
+### 4.5 Diagnostic « config vs données »
+
+Objectif : quand la validation échoue massivement, aider le lecteur à savoir si le
+problème vient d'une **mauvaise configuration** (mauvais schéma, mauvais format de date
+attendu, mauvais séparateur, mauvais encoding…) ou d'un **fichier réellement
+invalide**. Sans ce diagnostic, un rapport qui dit « fichier invalide » envoie les gens
+chasser un problème de données qui est en fait un problème de config.
+
+**Principe : le moteur suggère, il n'affirme pas.** Il ne peut pas *prouver* que la
+config est fausse ; il expose des **indices hiérarchisés par confiance**. Le fichier
+reste marqué INVALID (les règles ont échoué, c'est un fait), mais le rapport oriente la
+recherche. La décision reste humaine.
+
+**Signatures détectées (socle fiable, calculé à partir des compteurs existants) :**
+
+- **Header mismatch** — les noms de colonnes du fichier ne correspondent pas au schéma.
+  Confiance : quasi-certain que c'est la config (mauvais schéma ou mauvais fichier).
+- **Toutes les colonnes en échec simultanément** — signature typique d'un mauvais
+  séparateur, encoding, ou décalage d'en-tête. Confiance : très probable config.
+- **100 % d'échec sur une colonne** — toute la colonne viole la même règle (ex. dates
+  en `DD/MM/YYYY` alors que le schéma attend `YYYY-MM-DD`). Confiance : probable config.
+- **Échec partiel et épars** — une règle échoue sur une petite fraction de lignes de
+  façon dispersée. Confiance : probable données (vraies erreurs — ce qu'on veut rejeter).
+
+**Deux niveaux d'exposition :**
+
+- **Par règle** (`diagnostic_hint` + `failure_rate`) : pour creuser — quelle règle,
+  quelle colonne porte le signal.
+- **Global** (`diagnostic` en tête de rapport) : pour le premier coup d'œil — agrège
+  les signaux des règles en un message clair (« plusieurs signaux suggèrent un problème
+  de configuration : séparateur ? schéma ? format de date ? » vs « les échecs
+  ressemblent à de vraies erreurs de données »).
+
+**Extensibilité.** Le socle calcule des signaux bruts robustes (taux d'échec,
+100 %-colonne, toutes-colonnes, header-mismatch). Une couche d'interprétation les
+traduit en hypothèses lisibles (« mauvais séparateur probable », « format de date mal
+configuré »). Les messages peuvent être enrichis plus tard sans retoucher le calcul des
+signaux.
 
 ---
 
@@ -323,7 +368,68 @@ expressions Polars vectorisées** plutôt qu'en boucles Python.
 
 ---
 
-## 8. Points d'extension (récapitulatif)
+## 8. Multi-format : préparer la validation XML (v2)
+
+Objectif : le moteur validera d'abord du CSV, puis devra aussi valider du XML dans un
+second temps. On ne conçoit pas l'implémentation XML maintenant (sa forme exacte est
+encore inconnue), mais on identifie les **points de couture** pour que l'ajout du XML
+n'oblige pas à refondre le moteur.
+
+**Le CSV est tabulaire et plat** (lignes × colonnes). **Le XML est hiérarchique et
+imbriqué** (éléments, attributs, répétitions, profondeur arbitraire). Cette différence
+touche trois couches — et trois seulement.
+
+### 8.1 Ce qui diverge par format (à abstraire)
+
+- **Ingestion (DataSource)** : le CSV produit un `LazyFrame` Polars tabulaire. Le XML
+  produira une autre représentation (voir 8.2). L'interface DataSource doit donc être
+  généralisée : « fournir les données sous une forme exploitable par les règles »,
+  sans présupposer que c'est un tableau.
+- **Représentation en mémoire** : tabulaire (Polars) pour le CSV ; pour le XML, deux
+  cas possibles selon la structure réelle — soit un **aplatissement** en tabulaire
+  quand la structure est régulière (liste de records répétés → table, on garde Polars
+  et le streaming), soit un **modèle arborescent** streamé (type iterparse/SAX) si la
+  structure est vraiment imbriquée. Le choix sera fait quand le XML sera connu.
+- **Implémentations de règles structurelles** : la règle « Schema Structure » ou
+  « Field Format » n'a pas la même implémentation sur un tableau plat et sur un arbre.
+  Le RuleRegistry doit pouvoir associer un même *type de règle* à des implémentations
+  **différentes selon le format**.
+- **Scopes** : les scopes actuels (CELL, COLUMN, ROW, CROSS) sont tabulaires. Le XML
+  ajoutera des scopes arborescents (NODE/ELEMENT, ATTRIBUTE, chemin, cardinalité d'un
+  élément répété…). Le modèle de scope doit rester ouvert (énumération extensible).
+
+### 8.2 Ce qui reste commun (mutualisé, inchangé)
+
+Tout le cœur du moteur est indépendant du format et ne bouge pas :
+
+- le **catalogue de règles** (données) et son chargement,
+- le modèle de **phases + gate bloquant**,
+- la **sévérité** (BLOCKING / COLLECTING),
+- les **exemptions** de colonnes/éléments (statuts ERROR / WAIVED),
+- le **rapport** structuré et borné,
+- le **RuleRegistry** en tant que mécanisme (seules les implémentations enregistrées
+  varient).
+
+### 8.3 Note sur le schéma
+
+Le **XSD est déjà le schéma naturel du XML** : aucune conversion de schéma à prévoir
+pour le cas XML (c'est son usage d'origine). Le schéma normalisé (section 4.1) reste le
+point de convergence : XSD et JSON l'alimentent déjà ; pour le XML, il faudra
+simplement enrichir le schéma normalisé avec la dimension hiérarchique (relations
+parent/enfant, cardinalités) que le format tabulaire n'utilise pas.
+
+### 8.4 Abstraction cible
+
+Introduire une notion de **DataFormat** (CSV / XML) qui regroupe, par format : sa
+DataSource, sa représentation mémoire, et son jeu d'implémentations de règles
+structurelles. Le moteur sélectionne le DataFormat selon l'entrée, puis exécute la
+même mécanique (catalogue, phases, gate, rapport) par-dessus. **Rien de tout cela
+n'est codé en v1** — on s'assure seulement que ces interfaces existent pour que la v2
+XML soit un ajout, pas une réécriture.
+
+---
+
+## 9. Points d'extension (récapitulatif)
 
 | Besoin | Où l'on agit | Impact sur le moteur |
 |--------|--------------|----------------------|
@@ -335,10 +441,11 @@ expressions Polars vectorisées** plutôt qu'en boucles Python.
 | Réordonner / ajouter une phase | configuration des phases | aucun |
 | Activer/désactiver une règle | champ `enabled` du catalogue | aucun |
 | Exempter des colonnes d'une règle | champ `exempted_columns` du catalogue | aucun |
+| Nouveau format de données (XML) | nouveau DataFormat (DataSource + règles structurelles) | cœur inchangé (cf. §8) |
 
 ---
 
-## 9. Zones à confirmer / décisions ouvertes
+## 10. Zones à confirmer / décisions ouvertes
 
 - **Gate strict ou partiel en phase Structure** : un fichier avec une colonne en trop
   bloque-t-il tout, ou tolère-t-on certaines colonnes en continuant sur les autres ?

@@ -1,9 +1,349 @@
-=SI(résultat>=1024; TEXTE(résultat/1024;"0,##")&" GB"; résultat&" MB")
+# Moteur de validation CSV — Document de conception
 
-=SOMMEPROD(
-  SIERREUR(SI(ESTNUM(CHERCHE("GB";B17:B25));
-    VALEUR(SUBSTITUE(SUBSTITUE(B17:B25;" GB";"");"GB";""))*1024;0);0)
-  +
-  SIERREUR(SI(ESTNUM(CHERCHE("MB";B17:B25));
-    VALEUR(SUBSTITUE(SUBSTITUE(B17:B25;" MB";"");"MB";""));0);0)
-)
+**Version** : 1.0 — conception pure
+**Périmètre** : le moteur de validation uniquement. L'ingress (Kafka) et l'egress
+(destination du rapport) sont hors périmètre et représentés par des interfaces
+abstraites. Le moteur reçoit ses entrées et produit un objet rapport en mémoire.
+
+---
+
+## 1. Objectif et contraintes
+
+Le moteur valide un fichier CSV contre un schéma (XSD ou JSON) et un catalogue de
+règles de qualité de données, puis produit un rapport structuré indiquant si le
+fichier est valide et, sinon, la liste détaillée des erreurs.
+
+Contraintes structurantes retenues pendant l'analyse :
+
+- **Volume** : fichiers jusqu'à ~5 Go. Traitement en flux (streaming), mémoire bornée.
+- **Pas d'écriture disque** : lecture en flux autorisée (depuis IBM COS, API S3),
+  aucune écriture de fichier temporaire. Tout le pipeline reste en mémoire / lazy.
+- **Polars** comme moteur d'exécution (lazy + streaming), pour le parallélisme natif
+  (Rust, hors GIL) et la maîtrise mémoire.
+- **Extensibilité totale** : le catalogue de règles est une donnée d'entrée, pas du
+  code. On ajoute / active / désactive une règle sans modifier le moteur.
+- **Deux formats de schéma** : XSD (legacy) et JSON (v2), ramenés à une
+  représentation interne commune.
+- **Sévérité portée par la règle** : certaines règles sont bloquantes (arrêt), d'autres
+  collectantes (on note et on continue).
+
+---
+
+## 2. Principes d'architecture
+
+Trois principes gouvernent toute la conception.
+
+**Découplage des entrées/sorties.** Le moteur ne connaît ni la provenance de ses
+entrées ni la destination de sa sortie. Une source de données abstraite fournit le
+flux CSV ; un puits de rapport abstrait reçoit le résultat. Kafka et COS deviennent
+de simples implémentations branchables plus tard.
+
+**Le schéma est une source de métadonnées normalisée.** XSD et JSON sont deux
+formats d'entrée qui alimentent une même structure interne (liste de définitions de
+colonnes). Le reste du moteur ignore d'où vient le schéma.
+
+**Tout est règle, mais l'exécution est séquencée par phases.** La conformité
+structurelle (colonnes, types, obligatoires) et les règles métier partagent le même
+modèle d'objet et la même mécanique d'exécution. Ce qui les distingue, c'est une
+propriété de *phase* et une propriété de *sévérité*. Le moteur exécute les phases
+dans l'ordre ; une règle bloquante en échec empêche de passer à la phase suivante.
+
+---
+
+## 3. Vue d'ensemble des composants
+
+```
+                        ┌──────────────────────────────┐
+                        │        Orchestrateur          │
+                        │   (ValidationEngine)          │
+                        └──────────────┬───────────────┘
+                                       │ pilote le flux
+        ┌──────────────┬──────────────┼───────────────┬──────────────────┐
+        ▼              ▼              ▼               ▼                  ▼
+┌───────────────┐ ┌──────────┐ ┌───────────┐ ┌──────────────┐ ┌────────────────┐
+│  DataSource   │ │ Schema   │ │  Rule     │ │  Execution   │ │   Report        │
+│  (abstraite)  │ │ Parser   │ │ Catalog   │ │  Planner +   │ │   Builder       │
+│               │ │ (XSD/    │ │ Loader    │ │  Runner      │ │                 │
+│  → LazyFrame  │ │  JSON)   │ │           │ │              │ │  → ValidationRe │
+│    Polars     │ │ → Schema │ │ → Rule[]  │ │  (par phase, │ │    port (objet) │
+│               │ │  normal. │ │           │ │   par scope) │ │                 │
+└───────────────┘ └──────────┘ └───────────┘ └──────┬───────┘ └────────┬───────┘
+                                                      │                   │
+                                              ┌───────▼────────┐          │
+                                              │  Rule Registry │          │
+                                              │  (types de     │          ▼
+                                              │   règles       │   ┌──────────────┐
+                                              │   enregistrés) │   │ ReportSink   │
+                                              └────────────────┘   │ (abstraite)  │
+                                                                    └──────────────┘
+```
+
+### Responsabilités
+
+**DataSource (abstraite).** Fournit le CSV sous forme de `LazyFrame` Polars, en
+streaming depuis une URI (COS/S3, fichier local pour les tests…). Ne charge jamais
+tout en mémoire. Une implémentation concrète par backend de stockage.
+
+**SchemaParser (XSD / JSON).** Lit le schéma et produit un *schéma normalisé*
+(section 4.1). Deux implémentations interchangeables derrière une interface commune ;
+un sélecteur choisit selon le format d'entrée. Résout les types nommés et les facettes.
+
+**RuleCatalogLoader.** Lit le catalogue de règles (données : issu du fichier DQ
+catalog) et produit une liste d'objets `Rule` (section 4.2). Filtre sur les règles
+actives. Ne contient aucune logique de validation — juste du chargement/mapping.
+
+**RuleRegistry.** Table qui associe chaque *type de règle* (Structural, Format,
+Completeness, Empty File, Readability…) à son implémentation. C'est le point
+d'extension : ajouter un nouveau type de règle = l'enregistrer ici. Le catalogue
+référence des types ; le registre sait les exécuter.
+
+**ExecutionPlanner + Runner.** Le planificateur organise les règles par *phase*
+(ordre d'exécution) puis, à l'intérieur d'une phase, les regroupe par *scope* pour
+minimiser le nombre de passes sur les 5 Go. Le runner exécute phase après phase,
+applique le gate bloquant, et transmet les résultats au ReportBuilder.
+
+**ReportBuilder.** Agrège les résultats de toutes les règles en un objet
+`ValidationReport` structuré et lisible (section 4.3).
+
+**ReportSink (abstraite).** Reçoit le rapport final. Hors périmètre pour
+l'implémentation ; existe seulement comme interface (un `InMemorySink` suffit pour
+tester).
+
+---
+
+## 4. Modèle de données
+
+### 4.1 Schéma normalisé
+
+Produit par les parseurs, consommé par le moteur. Indépendant du format source.
+
+**Schéma** : une collection ordonnée de définitions de colonnes + des métadonnées
+globales (nom/version du schéma, ordre attendu des colonnes).
+
+**ColumnDefinition** (une par colonne du CSV) :
+
+- `name` : nom de la colonne (ex. `InstrmtName`).
+- `base_type` : type de base résolu — `string`, `decimal`, `integer`,
+  `positive_integer`, `date`, `datetime`.
+- `nullable` : la cellule peut-elle être vide ? (dérivé de `nillable`).
+- `constraints` : ensemble de facettes normalisées, selon le type :
+  - string → `max_length`, éventuellement `pattern`
+  - decimal → `total_digits`, `fraction_digits`
+  - énumération → `allowed_values` (ex. `YesNo` → {Y, N}, `UnitType` → {U, V, C},
+    `Sign` → {+, −})
+  - date/datetime → `format` attendu
+- `semantic_type` (optionnel) : étiquette sémantique issue des types nommés
+  (`Price`, `Qty`, `Amt`, `PriceOffset`…), sans contrainte forte mais utile au
+  reporting et à d'éventuelles règles métier.
+
+**Résolution de type (rôle du parseur XSD).** Trois familles observées dans le
+schéma réel, toutes ramenées à la même structure :
+
+1. **Énumérations** — `simpleType` avec `xs:enumeration` → `allowed_values`.
+   Ex. `YesNo`, `UnitType`, `Sign`, `Currency`, `PriceMode`.
+2. **Décimaux à précision** — `simpleType` (ou restriction inline) avec
+   `totalDigits`/`fractionDigits` → contraintes decimal.
+   Ex. `decimal257` (25,7), `decimal259` (25,9), restrictions inline.
+3. **Types sémantiques libres** — `simpleType` alias d'un type de base sans facette
+   (`Price`, `Qty`, `Amt` → decimal libre) → `base_type` + `semantic_type`.
+
+Le parseur fait deux passes : (1) collecte tous les `simpleType` nommés globaux dans
+une table de types ; (2) résout chaque colonne contre cette table, en fusionnant avec
+d'éventuelles restrictions inline.
+
+> **Point de justesse decimal** : `total_digits=25` dépasse la précision d'un float64
+> (~15–17 chiffres). Pour *valider* la précision, la colonne doit être lue en **texte
+> brut** et vérifiée lexicalement (analyse de la chaîne), et non convertie en float.
+> C'est à la fois plus juste et compatible streaming.
+
+### 4.2 Objet Rule
+
+Directement calqué sur le catalogue DQ. Une règle est une **donnée de configuration**
+qui référence un type d'implémentation et porte ses paramètres.
+
+- `rule_id` : identifiant unique (ex. `DQ-001a`).
+- `name` : libellé (ex. « Schema Structure »).
+- `rule_type` : type technique → clé dans le RuleRegistry (Structural, Format,
+  Completeness, EmptyFile, Readability…). C'est ce qui dit *quelle implémentation*
+  exécute la règle.
+- `dimension` : catégorie métier pour le reporting (Validity, Completeness,
+  Integrity…).
+- `scope` : niveau d'application — `FILE`, `COLUMN`, `CELL`, `ROW`, `CROSS`
+  (mappé depuis « Applies To » : File / Fields).
+- `phase` : rang d'exécution (voir section 5). Détermine l'ordre et le gate.
+- `severity` : `BLOCKING` (rejet, arrêt du gate) ou `COLLECTING` (on note, on
+  continue). Mappé depuis « Action on Failure » (Reject → BLOCKING).
+- `threshold` : paramètre de tolérance (ex. `0 tolerance`, `min 1 data row`).
+- `params` : paramètres libres spécifiques au type de règle.
+- `enabled` : actif ou non (permet d'activer/désactiver via le catalogue).
+- `target_columns` (optionnel) : colonnes concernées, sinon toutes.
+- `exempted_columns` (optionnel) : whitelist de colonnes exemptées de cette règle
+  (voir section 4.4). Les colonnes exemptées sont **quand même testées**, mais leurs
+  erreurs sont neutralisées (tracées, non bloquantes).
+
+**Extensibilité.** Ajouter une règle a deux formes possibles :
+- même logique, autre configuration → nouvelle ligne dans le catalogue, rien à coder.
+- logique inédite → nouveau type enregistré dans le RuleRegistry, puis référencé
+  depuis le catalogue. Le moteur ne change jamais.
+
+**Chaînage.** À l'intérieur d'une phase et d'un scope, les règles s'exécutent en
+séquence. Une règle `BLOCKING` en échec court-circuite la suite de la chaîne (les
+règles suivantes n'ont plus de sens) ; une règle `COLLECTING` laisse la chaîne
+continuer et ses erreurs s'agrègent.
+
+### 4.3 ValidationReport
+
+Objet structuré en mémoire, lisible, orienté « pourquoi le fichier est invalide ».
+
+- `status` : `VALID` / `INVALID`.
+- `file_ref` : référence du fichier validé.
+- `schema_ref` : schéma utilisé (nom + version).
+- `stopped_at_phase` (optionnel) : phase où le gate a bloqué, le cas échéant.
+- `summary` : compteurs globaux (nb d'erreurs, nb par sévérité, nb de lignes
+  contrôlées, nb de lignes en erreur).
+- `results` : liste de résultats par règle, chacun avec :
+  - `rule_id`, `name`, `scope`, `severity`, `dimension`, `phase`
+  - `passed` : booléen (calculé sur les erreurs **non exemptées** uniquement)
+  - `error_count` : erreurs réelles (comptent, peuvent bloquer)
+  - `waived_count` : erreurs sur colonnes exemptées (tracées, neutralisées)
+  - `errors` : échantillon détaillé et **borné** (voir ci-dessous) — colonne, n° de
+    ligne le cas échéant, valeur fautive, message expliquant l'attendu vs le constaté,
+    et un statut (`ERROR` ou `WAIVED`).
+  - `exempted_columns` : colonnes exemptées pour cette règle, avec leur `waived_count`
+    respectif (traçabilité : « ce qui aurait échoué »).
+
+> **Bornage du rapport** : sur un fichier de 5 Go, une règle peut échouer sur des
+> millions de lignes. Le rapport conserve un **compteur exact** par règle + un
+> **échantillon borné** (top N erreurs) plutôt que la liste exhaustive, pour rester
+> exploitable et tenir en mémoire. Le seuil N est un paramètre du moteur.
+
+### 4.4 Exemptions de colonnes (whitelist tracée)
+
+Besoin : pour une règle donnée, exempter certaines colonnes tout en gardant une trace
+de ce qui aurait échoué (audit). Portée : **colonnes uniquement**. Mode : **testé mais
+neutralisé** (les colonnes exemptées sont bien évaluées, mais leurs erreurs ne comptent
+pas et ne bloquent pas).
+
+Conséquence sur le modèle : une erreur porte un **statut**, pas juste un booléen.
+
+- `ERROR` : erreur sur une colonne non exemptée → comptée, peut déclencher le gate.
+- `WAIVED` : erreur sur une colonne exemptée → tracée dans le rapport, **neutralisée**
+  (n'invalide pas le fichier, ne déclenche pas le gate).
+
+Comportement :
+
+- La whitelist vit sur la règle (`exempted_columns`), au plus près de la configuration
+  du catalogue.
+- Le moteur **teste** les colonnes exemptées comme les autres (le calcul est fait),
+  puis reclasse leurs erreurs en `WAIVED`.
+- Le `passed` d'une règle et le gate bloquant se calculent sur les erreurs `ERROR`
+  seulement. Une règle `BLOCKING` dont **toutes** les erreurs sont `WAIVED` ne bloque
+  pas.
+- Le rapport expose `error_count`, `waived_count`, et le détail par colonne exemptée —
+  on voit donc l'impact réel de l'exemption et on peut décider de la retirer plus tard
+  en connaissance de cause.
+
+> Coût : le mode « testé mais neutralisé » implique que le calcul de validation est
+> bien exécuté sur les colonnes exemptées (pas d'économie de calcul), contrairement à
+> un mode « non testé » qui les sortirait du périmètre. C'est le prix de la
+> traçabilité demandée.
+
+---
+
+## 5. Phases d'exécution
+
+L'analyse du catalogue DQ fait émerger un ordre naturel, chaque niveau servant de
+*gate* au suivant. Les phases sont **ordonnées et paramétrables** (pas figées à deux).
+
+| Phase | Nom | Exemple de règle | Scope | Pourquoi c'est un gate |
+|-------|-----|------------------|-------|------------------------|
+| 0 | Lisibilité | DQ-003 Readability/Corruption | FILE | inutile de continuer si le fichier ne se parse pas |
+| 1 | Non-vide | DQ-002 Empty File | FILE | inutile de valider les colonnes d'un fichier sans données |
+| 2 | Structure | DQ-001a Schema Structure | FILE | inutile de valider les valeurs si les colonnes sont fausses |
+| 3 | Format + obligatoires | DQ-001b Field Format, DQ-001c Mandatory Fields | CELL/COLUMN | conformité au schéma avant le métier |
+| 4 | Métier | règles enrichies (catalogue vivant) | tous | n'a de sens que sur des données conformes |
+
+Règle du gate : si une règle `BLOCKING` échoue dans une phase, on n'entre pas dans la
+phase suivante ; le rapport indique `stopped_at_phase`. Les règles `COLLECTING` ne
+bloquent pas la progression. Une règle `BLOCKING` dont toutes les erreurs sont
+`WAIVED` (colonnes exemptées, cf. 4.4) est considérée comme non bloquante.
+
+---
+
+## 6. Flux d'exécution (du CSV au rapport)
+
+1. **Réception des entrées** : URI du CSV, schéma (XSD ou JSON), catalogue de règles.
+   (La façon dont elles arrivent est hors périmètre.)
+2. **Parsing du schéma** → schéma normalisé (résolution de types).
+3. **Chargement du catalogue** → liste de `Rule` actives, via le RuleRegistry.
+4. **Ouverture de la source** : `DataSource` fournit un `LazyFrame` Polars en
+   streaming depuis l'URI. Les colonnes decimal à précision sont typées en texte pour
+   validation lexicale.
+5. **Planification** : les règles sont triées par phase, puis regroupées par scope à
+   l'intérieur de chaque phase.
+6. **Exécution par phase** :
+   - phase 0/1/2 (scope FILE) : contrôles globaux (parse OK, ≥1 ligne, en-tête
+     conforme au schéma).
+   - phase 3 (scope CELL/COLUMN/ROW) : **une seule passe vectorisée** regroupant un
+     maximum de règles en expressions Polars, pour ne pas relire les 5 Go par règle.
+   - phase 4 (métier) : idem pour cellule/colonne/ligne ; les règles CROSS (unicité,
+     doublons, agrégats) sont traitées à part avec les agrégats appropriés.
+   - après chaque phase, application du gate bloquant.
+7. **Construction du rapport** : agrégation des résultats, compteurs, échantillons
+   bornés → `ValidationReport`.
+8. **Émission** : le rapport est remis au `ReportSink` (abstrait ici).
+
+---
+
+## 7. Performance et parallélisme
+
+**Le parallélisme vient de Polars, pas de threads Python.** Polars (Rust, hors GIL)
+parallélise nativement l'évaluation des expressions sur tous les cœurs et gère la
+mémoire en streaming. Le rôle du moteur est de **formuler la validation en
+expressions Polars vectorisées** plutôt qu'en boucles Python.
+
+- `threading` Python : inutile (GIL ; le calcul est déjà hors GIL dans Polars).
+- `multiprocessing` sur un seul fichier : à éviter (duplication mémoire, et casse les
+  règles CROSS qui ont besoin de voir tout le dataset). Le seul usage pertinent du
+  multiprocessing serait de valider **plusieurs fichiers en parallèle** — mais c'est
+  de l'orchestration au-dessus du moteur, hors de son cœur.
+
+**Leviers concrets** :
+
+- **Lazy + streaming** (`scan_csv` → `collect(streaming=True)`) : mémoire bornée sur
+  5 Go. C'est le vrai levier mémoire.
+- **Regroupement par scope** : une passe vectorisée couvre plusieurs règles
+  cellule/colonne/ligne au lieu d'une relecture par règle.
+- **Décimaux en texte** : validation lexicale de la précision, sans conversion float
+  (justesse + compatibilité streaming).
+- **Règles CROSS isolées** : ce sont les seules coûteuses (matérialisation possible de
+  clés). Stratégies dédiées (agrégats streamables, hachage de clés) plutôt que
+  parallélisme manuel.
+- **Rapport borné** : compteurs exacts + échantillons, pas de liste exhaustive.
+
+---
+
+## 8. Points d'extension (récapitulatif)
+
+| Besoin | Où l'on agit | Impact sur le moteur |
+|--------|--------------|----------------------|
+| Nouveau format de schéma (ex. YAML) | nouveau SchemaParser | aucun |
+| Nouveau backend de stockage | nouvelle DataSource | aucun |
+| Nouvelle destination de rapport | nouveau ReportSink | aucun |
+| Nouvelle règle (logique existante) | ligne dans le catalogue | aucun |
+| Nouvelle règle (logique inédite) | type dans le RuleRegistry | aucun |
+| Réordonner / ajouter une phase | configuration des phases | aucun |
+| Activer/désactiver une règle | champ `enabled` du catalogue | aucun |
+| Exempter des colonnes d'une règle | champ `exempted_columns` du catalogue | aucun |
+
+---
+
+## 9. Zones à confirmer / décisions ouvertes
+
+- **Gate strict ou partiel en phase Structure** : un fichier avec une colonne en trop
+  bloque-t-il tout, ou tolère-t-on certaines colonnes en continuant sur les autres ?
+- **Politique CROSS sur très gros volume** : borne mémoire acceptable pour les règles
+  de doublons/unicité (matérialisation de clés).
+- **Valeur de N** (taille des échantillons d'erreurs dans le rapport).
+- **Types énumérés restants** (`Currency`, `PriceMode`) : contraintes exactes à
+  confirmer (longueur ISO 3 lettres ? liste fermée ?).

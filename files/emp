@@ -1,0 +1,250 @@
+# Exemple de bout en bout — CSV + XSD + règles → rapport
+
+Cas concret illustrant le moteur sur un extrait du schéma d'instruments. On part d'un
+XSD (extrait), d'une liste de règles (config), d'un fichier CSV contenant quelques
+erreurs volontaires, et on montre le rapport produit.
+
+---
+
+## 1. Le schéma (extrait de XSD)
+
+On ne garde que 5 colonnes pour l'exemple :
+
+```xml
+<xs:element name="InstrmtName" nillable="false">
+  <xs:simpleType><xs:restriction base="xs:string">
+    <xs:maxLength value="150"/>
+  </xs:restriction></xs:simpleType>
+</xs:element>
+
+<xs:element name="InstrmtCcy" type="Currency" nillable="false"/>
+
+<xs:element name="IssDt" type="xs:date" nillable="true"/>
+<xs:element name="MatDt" type="xs:date" nillable="true"/>
+
+<xs:element name="FloatingRtFlag" type="YesNo" nillable="true"/>
+```
+
+Types nommés (déclarés plus haut dans le XSD) :
+
+```xml
+<xs:simpleType name="YesNo">
+  <xs:restriction base="xs:string">
+    <xs:enumeration value="Y"/><xs:enumeration value="N"/>
+  </xs:restriction>
+</xs:simpleType>
+
+<xs:simpleType name="Currency">
+  <xs:restriction base="xs:string"><xs:maxLength value="3"/></xs:restriction>
+</xs:simpleType>
+```
+
+**Ce que le parseur en déduit** (schéma normalisé) :
+
+| Colonne | base_type | nullable | contraintes |
+|---------|-----------|----------|-------------|
+| InstrmtName | string | non | max_length = 150 |
+| InstrmtCcy | string | non | max_length = 3 |
+| IssDt | date | oui | format date |
+| MatDt | date | oui | format date |
+| FloatingRtFlag | string (enum) | oui | allowed_values = {Y, N} |
+
+---
+
+## 2. La liste des règles (config reçue en entrée)
+
+Le moteur reçoit cette liste (lue en amont depuis la table de config, pas par le moteur
+lui-même). Notez la règle `check-types` qui **active** la validation technique déduite
+du XSD.
+
+| rule_id | rule_type | scope | severity | params |
+|---------|-----------|-------|----------|--------|
+| R-000 | Readability | FILE | BLOCKING | — |
+| R-001 | EmptyFile | FILE | BLOCKING | min 1 row |
+| R-002 | SchemaStructure | FILE | BLOCKING | colonnes attendues = les 5 |
+| R-010 | check-types | COLUMN | BLOCKING | (déduit tout du XSD) |
+| R-030 | DateOrder | ROW | COLLECTING | MatDt >= IssDt |
+
+`check-types` étant présente, le parseur charge **toute** la validation technique
+déduite du XSD : format date sur `IssDt`/`MatDt`, longueur sur
+`InstrmtName`/`InstrmtCcy`, énumération sur `FloatingRtFlag`, et **obligatoire**
+(`nillable=false`) sur `InstrmtName`/`InstrmtCcy`. Il n'y a pas de règle séparée pour
+l'obligatoire ou le format : tout cela est *déduit du XSD* et activé par `check-types`.
+Seul `DateOrder` (cohérence métier inter-colonnes) est déclaré explicitement, car il ne
+se déduit pas du XSD.
+
+### 2.1 Exemples de règles détaillées (lignes de config)
+
+Point clé : **la validation technique (type, longueur, énumération, format de date,
+obligatoire via `nillable`) vient du XSD**, pas de la config. On ne redéfinit jamais un
+type/format/longueur dans la table — le XSD contient déjà cette information, et la règle
+`check-types` dit simplement « exploite-la ». La table de config ne contient donc que :
+les règles de **structure/fichier**, l'**activation** de la validation technique
+(`check-types`), les règles **métier** qui ne se déduisent pas du XSD, et des
+**surcharges** (activer/désactiver, exempter des colonnes).
+
+Chaque règle vue champ par champ telle qu'elle serait stockée en table (présentée ici
+en JSON pour la lisibilité) :
+
+Une règle de **structure** (scope FILE, bloquante) :
+
+```json
+{
+  "rule_id": "R-002",
+  "rule_type": "SchemaStructure",
+  "scope": "FILE",
+  "check_nature": "COLUMN_AGGREGATE",
+  "severity": "BLOCKING",
+  "dimension": "Validity",
+  "threshold": "0 tolerance",
+  "params": { "expected_columns": ["InstrmtName","InstrmtCcy","IssDt","MatDt","FloatingRtFlag"], "ordered": true },
+  "enabled": true
+}
+```
+
+La règle **check-types** (scope COLUMN) — elle **active** la validation technique
+déduite du XSD. Elle ne porte aucun paramètre de type : tout (date, longueur,
+énumération, obligatoire) vient du XSD. Dans l'exemple courant elle n'exempte rien
+(elle valide toutes les colonnes). Le champ optionnel `exempted_columns` permettrait
+d'exclure certaines colonnes de la validation technique — testées quand même, mais
+erreurs neutralisées / tracées. Illustration (variante, non utilisée dans le rapport
+ci-dessous) :
+
+```json
+{
+  "rule_id": "R-010",
+  "rule_type": "check-types",
+  "scope": "COLUMN",
+  "check_nature": "PER_CELL",
+  "severity": "BLOCKING",
+  "dimension": "Validity",
+  "params": {},
+  "exempted_columns": ["FloatingRtFlag"],
+  "enabled": true
+}
+```
+
+> Ici `FloatingRtFlag` est exemptée : sa validation d'énumération (déduite du XSD) est
+> quand même exécutée, mais ses erreurs sont classées `WAIVED` — tracées, non bloquantes.
+> Sans `exempted_columns`, `check-types` valide **toutes** les colonnes du XSD.
+
+Une règle **métier inter-colonnes** (scope ROW, collectante) — ce type de règle ne se
+déduit PAS du XSD : « MatDt >= IssDt » est une cohérence fonctionnelle, elle doit donc
+être déclarée en config :
+
+```json
+{
+  "rule_id": "R-030",
+  "rule_type": "DateOrder",
+  "scope": "ROW",
+  "check_nature": "CROSS_COLUMN",
+  "severity": "COLLECTING",
+  "dimension": "Integrity",
+  "params": { "left": "MatDt", "op": ">=", "right": "IssDt" },
+  "enabled": true
+}
+```
+
+En résumé : la validation **technique** (R-010 `check-types`, alimentée par le XSD) et
+les règles **métier** (R-030, déclarées en config) coexistent dans la même liste. Les
+règles métier réutilisent des `rule_type` implémentés dans le registre (code) ; les
+ajouter/modifier ne demande aucune modification du moteur, seulement de la config.
+
+---
+
+## 3. Le fichier CSV (avec erreurs volontaires)
+
+```csv
+InstrmtName,InstrmtCcy,IssDt,MatDt,FloatingRtFlag
+Bond Alpha,EUR,2024-01-15,2029-01-15,N
+Bond Beta,USD,2023-06-01,2028-06-01,Y
+Note Gamma,EURO,2024-03-10,2030-03-10,N
+Bond Delta,GBP,15/04/2024,2031-04-01,Y
+,USD,2024-05-01,2020-05-01,X
+Bond Zeta,JPY,2024-07-01,2034-07-01,N
+```
+
+Les erreurs glissées (lignes numérotées à partir de 1 = première ligne de données) :
+
+- Ligne 3 : `InstrmtCcy = EURO` → 4 caractères, dépasse max_length = 3.
+- Ligne 4 : `IssDt = 15/04/2024` → mauvais format (attendu `YYYY-MM-DD`).
+- Ligne 5 : `InstrmtName` vide → viole nillable=false (obligatoire).
+- Ligne 5 : `FloatingRtFlag = X` → hors énumération {Y, N}.
+- Ligne 5 : `MatDt (2020) < IssDt (2024)` → viole MatDt >= IssDt.
+
+---
+
+## 4. L'exécution (par scope)
+
+**Scope FILE** — le fichier s'ouvre (R-000 OK), il a des lignes (R-001 OK), les 5
+colonnes attendues sont présentes et bien nommées (R-002 OK). Le gate passe : on entre
+dans les scopes suivants.
+
+**Scope COLUMN** — en une passe vectorisée, `check-types` (qui porte toute la
+validation technique déduite du XSD) détecte :
+- `EURO` ligne 3 (longueur > max 3),
+- `15/04/2024` ligne 4 (format date),
+- `X` ligne 5 (hors énumération),
+- `InstrmtName` vide ligne 5 (obligatoire, `nillable=false`).
+
+**Scope ROW** :
+- `DateOrder` : détecte `MatDt < IssDt` en ligne 5.
+
+Aucun gate en COLUMN/ROW : tout est collecté.
+
+> Note : `check-types` est BLOCKING mais en scope COLUMN — le fichier sera donc INVALID,
+> mais on ne coupe pas : les scopes de valeurs collectent tout pour le diagnostic.
+
+---
+
+## 5. Le rapport produit (ValidationReport)
+
+```
+status        : INVALID
+file_ref      : instruments_2024.csv
+schema_ref    : Instruments_Characteristics_CSV (extrait)
+stopped_at    : —   (le gate FILE est passé)
+
+summary
+  rows_checked   : 6
+  rows_in_error  : 3          (lignes 3, 4, 5)
+  error_count    : 5
+  by_severity    : BLOCKING 4 · COLLECTING 1
+
+results
+  R-002 SchemaStructure  (FILE, BLOCKING)     passed ✓
+  R-010 check-types      (COLUMN, BLOCKING)   passed ✗  error_count 4
+      • InstrmtCcy  ligne 3  "EURO"        longueur 4 > max 3
+      • IssDt       ligne 4  "15/04/2024"  format attendu YYYY-MM-DD
+      • FloatingRtFlag ligne 5 "X"         hors {Y, N}
+      • InstrmtName ligne 5  (vide)        obligatoire (nillable=false)
+      failure_rate 0.13 · diagnostic_hint LIKELY_DATA
+  R-030 DateOrder        (ROW, COLLECTING)    passed ✗  error_count 1
+      • ligne 5  MatDt 2020-05-01 < IssDt 2024-05-01
+      failure_rate 0.03 · diagnostic_hint LIKELY_DATA
+
+diagnostic (global)
+  Échecs partiels et épars (3–13 %) répartis sur plusieurs colonnes/règles.
+  → ressemble à de vraies erreurs de données (pas un problème de config).
+```
+
+---
+
+## 6. Variante — un problème de configuration
+
+Même fichier, mais on applique par erreur un schéma qui attend `IssDt` au format
+`DD/MM/YYYY`. Résultat : **toutes** les lignes de `IssDt` échouent au format.
+
+```
+results
+  R-010 check-types  (COLUMN)  passed ✗  error_count 6
+      failure_rate 1.00 · diagnostic_hint LIKELY_CONFIG
+
+diagnostic (global)
+  100 % de la colonne IssDt en échec de format.
+  → suspicion de configuration : mauvais format de date attendu ?
+     Vérifier le schéma avant de traiter le fichier comme invalide.
+```
+
+C'est le mécanisme config-vs-données : un échec à 100 % sur une colonne oriente vers un
+problème de config, pas vers un fichier réellement mauvais.

@@ -41,11 +41,11 @@ report sink receives the result. Kafka and COS become pluggable implementations 
 that feed a single internal structure (a list of column definitions). The rest of the
 engine ignores where the schema came from.
 
-**Everything is a rule, but execution is sequenced in phases.** Structural conformance
+**Everything is a rule, but execution is ordered by scope.** Structural conformance
 (columns, types, mandatory fields) and business rules share the same object model and
-the same execution mechanics. What sets them apart is a *phase* property and a
-*severity* property. The engine runs phases in order; a blocking rule that fails
-prevents moving to the next phase.
+execution mechanics. What sets their order apart is the *scope* (FILE before DATAFRAME,
+cf. section 5); what sets their criticality apart is *severity*. The gate acts only on
+structural checks: a failing blocking structural check prevents validating values.
 
 ---
 
@@ -64,8 +64,8 @@ prevents moving to the next phase.
 │  (abstract)   │ │ Parser   │ │ Catalog   │ │  Planner +   │ │   Builder       │
 │               │ │ (XSD/    │ │ Loader    │ │  Runner      │ │                 │
 │  → Polars     │ │  JSON)   │ │           │ │              │ │  → Validation   │
-│    LazyFrame  │ │ → norm.  │ │ → Rule[]  │ │  (per phase, │ │    Report       │
-│               │ │  schema  │ │           │ │   per scope) │ │    (object)     │
+│    LazyFrame  │ │ → norm.  │ │ → Rule[]  │ │  (per scope, │ │    Report       │
+│               │ │  schema  │ │           │ │  FILE→DFrame)│ │    (object)     │
 └───────────────┘ └──────────┘ └───────────┘ └──────┬───────┘ └────────┬───────┘
                                                       │                   │
                                               ┌───────▼────────┐          │
@@ -96,10 +96,10 @@ Empty File, Readability…) to its implementation. This is the extension point: 
 new rule type = registering it here. The catalog references types; the registry knows
 how to run them.
 
-**ExecutionPlanner + Runner.** The planner organizes rules by *phase* (execution
-order), then, within a phase, groups them by *scope* to minimize the number of passes
-over the 5 GB. The runner executes phase after phase, applies the blocking gate, and
-hands results to the ReportBuilder.
+**ExecutionPlanner + Runner.** The planner groups rules by execution *scope* (FILE then
+DATAFRAME) and, within DATAFRAME, stacks them into a minimum number of vectorized passes
+over the 5 GB. The runner executes FILE then DATAFRAME, applies the gate on structural
+checks, and hands results to the ReportBuilder.
 
 **ReportBuilder.** Aggregates the results of all rules into a structured, readable
 `ValidationReport` object (section 4.3).
@@ -137,8 +137,9 @@ name/version, expected column order).
 **Type resolution (XSD parser's role).** Three families observed in the real schema,
 all reduced to the same structure:
 
-1. **Enumerations** — `simpleType` with `xs:enumeration` → `allowed_values`.
-   E.g. `YesNo`, `UnitType`, `Sign`, `Currency`, `PriceMode`.
+1. **Enumerations** — `simpleType` with `xs:enumeration` → `allowed_values`, read
+   **dynamically** from the XSD (no hardcoded enumeration; exact values only matter at
+   test time). E.g. `YesNo`, `UnitType`, `Sign`, `Currency`, `PriceMode`.
 2. **Precision decimals** — `simpleType` (or inline restriction) with
    `totalDigits`/`fractionDigits` → decimal constraints.
    E.g. `decimal257` (25,7), `decimal259` (25,9), inline restrictions.
@@ -165,11 +166,20 @@ references an implementation type and carries its parameters.
   Completeness, EmptyFile, Readability…). This tells *which implementation* runs the
   rule.
 - `dimension`: business category for reporting (Validity, Completeness, Integrity…).
-- `scope`: application level — `FILE`, `COLUMN`, `CELL`, `ROW`, `CROSS` (mapped from
-  "Applies To": File / Fields).
-- `phase`: execution rank (see section 5). Determines order and gate.
+- `scope`: **execution** scope — `FILE` or `DATAFRAME` (see section 5).
+  - `FILE`: global checks done before touching the data (readability, non-empty,
+    header conformance, column existence/type).
+  - `DATAFRAME`: everything computed in Polars vectorized pass(es) over the data (cell
+    values, cross-column relations, aggregates).
+- `check_nature`: **descriptive metadata** of the rule (does not affect execution;
+  used by the report and diagnostic) — `PER_CELL` (per-row verdict: format, enumeration,
+  non-empty), `CROSS_COLUMN` (cross-column relation on a same row: `MatDt >= IssDt`),
+  `COLUMN_AGGREGATE` (whole-column property: uniqueness, global failure rate),
+  `CROSS_AGGREGATE` (aggregate over several columns/rows: pair uniqueness, sum = X).
 - `severity`: `BLOCKING` (reject, halts the gate) or `COLLECTING` (record, continue).
-  Mapped from "Action on Failure" (Reject → BLOCKING).
+  Mapped from "Action on Failure" (Reject → BLOCKING). Acts as a gate only for
+  structural checks (FILE scope / column structure); in DATAFRAME scope (values),
+  everything is collected without cutoff.
 - `threshold`: tolerance parameter (e.g. `0 tolerance`, `min 1 data row`).
 - `params`: free parameters specific to the rule type.
 - `enabled`: active or not (allows enabling/disabling via the catalog).
@@ -183,9 +193,9 @@ references an implementation type and carries its parameters.
 - brand-new logic → new type registered in the RuleRegistry, then referenced from the
   catalog. The engine never changes.
 
-**Chaining.** Within a phase and a scope, rules run in sequence. A `BLOCKING` rule that
-fails short-circuits the rest of the chain (subsequent rules no longer make sense); a
-`COLLECTING` rule lets the chain continue and its errors aggregate.
+**Chaining.** Rules of the same scope run together. In the structural scope, a failing
+`BLOCKING` rule prevents moving to values (gate). In DATAFRAME scope, `COLLECTING` rules
+aggregate without cutting off.
 
 ### 4.3 ValidationReport
 
@@ -194,14 +204,14 @@ Structured in-memory object, readable, oriented toward "why the file is invalid"
 - `status`: `VALID` / `INVALID`.
 - `file_ref`: reference of the validated file.
 - `schema_ref`: schema used (name + version).
-- `stopped_at_phase` (optional): phase where the gate halted, if any.
+- `stopped_at` (optional): the structural check where the gate halted, if any.
 - `summary`: global counters (error count, count by severity, rows checked, rows in
   error).
 - `diagnostic`: config-vs-data summary at the top of the report (see section 4.5) —
   aggregates signals from all rules to indicate, at a glance, whether the failure looks
   like a configuration problem or a genuinely invalid file.
 - `results`: list of per-rule results, each with:
-  - `rule_id`, `name`, `scope`, `severity`, `dimension`, `phase`
+  - `rule_id`, `name`, `scope`, `check_nature`, `severity`, `dimension`
   - `passed`: boolean (computed on **non-exempted** errors only)
   - `error_count`: real errors (count, may block)
   - `waived_count`: errors on exempted columns (traced, neutralized)
@@ -215,9 +225,9 @@ Structured in-memory object, readable, oriented toward "why the file is invalid"
     `waived_count` (traceability: "what would have failed").
 
 > **Report bounding**: on a 5 GB file a rule may fail on millions of rows. The report
-> keeps an **exact counter** per rule + a **bounded sample** (top N errors) rather than
-> the exhaustive list, to stay usable and fit in memory. The N threshold is an engine
-> parameter.
+> keeps an **exact counter** per rule + a **sample bounded** to the first N errors
+> rather than the exhaustive list, to stay usable and fit in memory. N is an engine
+> parameter, **100 by default** (adjustable, e.g. a more verbose debug mode).
 
 ### 4.4 Column exemptions (traced whitelist)
 
@@ -286,23 +296,52 @@ enriched later without touching the signal computation.
 
 ---
 
-## 5. Execution phases
+## 5. Execution order and gate (by scope)
 
-Analysis of the DQ catalog reveals a natural ordering, each level acting as a *gate*
-for the next. Phases are **ordered and configurable** (not hardcoded to two).
+Execution order and dependencies are carried directly by the **execution scope**,
+going from coarsest to finest. There is a single organizing axis — the scope — with
+two values only:
 
-| Phase | Name | Example rule | Scope | Why it's a gate |
-|-------|------|--------------|-------|-----------------|
-| 0 | Readability | DQ-003 Readability/Corruption | FILE | pointless to continue if the file won't parse |
-| 1 | Non-empty | DQ-002 Empty File | FILE | pointless to validate columns of a file with no data |
-| 2 | Structure | DQ-001a Schema Structure | FILE | pointless to validate values if columns are wrong |
-| 3 | Format + mandatory | DQ-001b Field Format, DQ-001c Mandatory Fields | CELL/COLUMN | schema conformance before business |
-| 4 | Business | enriched rules (living catalog) | all | only meaningful on conformant data |
+**1. `FILE`** — global checks done *before* processing the data:
+- readability / non-corruption (the file opens and parses);
+- non-empty (at least one data row);
+- header conformance to the schema (right columns, right order);
+- column existence and declared type.
 
-Gate rule: if a `BLOCKING` rule fails in a phase, the next phase is not entered; the
-report indicates `stopped_at_phase`. `COLLECTING` rules do not block progression. A
+**2. `DATAFRAME`** — everything computed in Polars vectorized pass(es) over the data,
+once the structure is validated: cell values (`PER_CELL`), cross-column relations
+(`CROSS_COLUMN`), column aggregates (`COLUMN_AGGREGATE`) and cross aggregates
+(`CROSS_AGGREGATE`). All these natures compute in the same pass(es) — Polars scans the
+column once and applies several stacked checks; distinguishing cell from column for
+*execution* would be artificial.
+
+**The gate acts only on structural checks — `FILE` and column existence/type.**
+
+- If a `FILE` blocking check fails (unreadable, empty, non-conformant header), the
+  `DATAFRAME` scope is not entered: validating values would be meaningless.
+- At the structural column level: **all** column-structure checks run first (to get the
+  full picture of columns in error), and *only then* does the gate block the move to
+  value checks if a structural column failed. We don't cut off at the first faulty
+  column — we want to see all broken columns at once (essential for diagnostics).
+- **Below, no gate**: value checks (`PER_CELL`, `CROSS_COLUMN`, aggregates) all run in
+  **collect** mode — everything is evaluated, all errors aggregated, nothing cuts off.
+  This preserves exhaustiveness and the config-vs-data diagnostic (100% of a column,
+  all columns failing…).
+
+Effective order: `FILE` (gate) → column structure (gate) → values on the `DATAFRAME`
+(full collection, no gate).
+
+The report indicates `stopped_at` (the structural check that blocked) if applicable. A
 `BLOCKING` rule whose errors are all `WAIVED` (exempted columns, cf. 4.4) is treated as
 non-blocking.
+
+> **Note.** The cell / cross-column / aggregate distinction is not an execution scope
+> but a **rule metadata** (`check_nature`, cf. 4.2). It doesn't change *how* we execute
+> (all done in a vectorized pass over the `DATAFRAME`), but it tells the report and
+> diagnostic *how to interpret* the result: a per-row verdict (list of faulty rows) or
+> an aggregate (column property, global failure rate). Polars provides both in the same
+> pass: the per-row boolean expression gives the detail, a `.sum()`/`.all()`/
+> `.n_unique()` on that same expression gives the aggregate.
 
 ---
 
@@ -314,16 +353,19 @@ non-blocking.
 3. **Load catalog** → list of active `Rule`s, via the RuleRegistry.
 4. **Open source**: `DataSource` provides a Polars `LazyFrame` streamed from the URI.
    Precision-decimal columns are typed as text for lexical validation.
-5. **Planning**: rules are sorted by phase, then grouped by scope within each phase.
-6. **Execution per phase**:
-   - phase 0/1/2 (FILE scope): global checks (parse OK, ≥1 row, header matches
-     schema).
-   - phase 3 (CELL/COLUMN/ROW scope): **a single vectorized pass** grouping as many
-     rules as possible into Polars expressions, to avoid re-reading the 5 GB per rule.
-   - phase 4 (business): same for cell/column/row; CROSS rules (uniqueness,
-     duplicates, aggregates) are handled separately with the appropriate aggregations.
-   - after each phase, apply the blocking gate.
-7. **Build report**: aggregate results, counters, bounded samples → `ValidationReport`.
+5. **Planning**: rules are grouped by execution scope (FILE then DATAFRAME), and within
+   DATAFRAME stacked into a minimum of vectorized passes.
+6. **Execution**:
+   - `FILE` scope: global checks (parse OK, ≥1 row, conformant header, column existence
+     and type). Gate: a blocking structural failure stops here (all column-structure
+     checks are nonetheless run before blocking, for the full picture).
+   - `DATAFRAME` scope: **a single pass** (or the minimum) grouping as many value checks
+     as possible into Polars expressions, to avoid re-reading the 5 GB per rule. No gate
+     here — full collection. (Cross aggregates `CROSS_AGGREGATE` — pair uniqueness, sums
+     — are out of v1 scope.)
+7. **Build report**: aggregate results, counters, bounded samples, config-vs-data
+   diagnostic → `ValidationReport`.
+8. **Emit**: the report is handed to the `ReportSink` (abstract here).
 8. **Emit**: the report is handed to the `ReportSink` (abstract here).
 
 ---
@@ -349,17 +391,18 @@ than Python loops.
   instead of one re-read per rule.
 - **Decimals as text**: lexical validation of precision, no float conversion
   (correctness + streaming compatibility).
-- **Isolated CROSS rules**: these are the only costly ones (possible key
-  materialization). Dedicated strategies (streamable aggregates, key hashing) rather
-  than manual parallelism.
+- **Cross aggregates out of v1**: `CROSS_AGGREGATE` rules (uniqueness/duplicates) — the
+  only ones that would break streaming and raise a memory risk — are not shipped in v1.
+  v1 therefore stays fully streamable; the `CROSS_AGGREGATE` nature stays described as a
+  seam for a later addition.
 - **Bounded report**: exact counters + samples, no exhaustive list.
 
 ---
 
 ## 8. Multi-format: preparing XML validation (v2)
 
-Goal: the engine will first validate CSV, then must also validate XML in a second
-phase. We are not designing the XML implementation now (its exact shape is still
+Goal: the engine will first validate CSV, then must also validate XML at a later
+stage. We are not designing the XML implementation now (its exact shape is still
 unknown), but we identify the **seams** so that adding XML won't require reworking the
 engine.
 
@@ -381,16 +424,18 @@ layers — and only three.
 - **Structural rule implementations**: the "Schema Structure" or "Field Format" rule
   does not have the same implementation on a flat table and on a tree. The RuleRegistry
   must be able to map a single *rule type* to **different implementations per format**.
-- **Scopes**: current scopes (CELL, COLUMN, ROW, CROSS) are tabular. XML will add tree
-  scopes (NODE/ELEMENT, ATTRIBUTE, path, cardinality of a repeated element…). The scope
-  model must stay open (extensible enumeration).
+- **Scopes**: the current execution scope (`FILE`, `DATAFRAME`) and the tabular rule
+  natures (`PER_CELL`, `CROSS_COLUMN`, `COLUMN_AGGREGATE`, `CROSS_AGGREGATE`) are
+  designed for tabular data. XML will add tree natures (NODE/ELEMENT, ATTRIBUTE, path,
+  cardinality of a repeated element…). The model must stay open (extensible
+  enumeration).
 
 ### 8.2 What stays common (shared, unchanged)
 
 The whole engine core is format-independent and does not move:
 
 - the **rule catalog** (data) and its loading,
-- the **phases + blocking gate** model,
+- the **scope ordering + structural gate** model,
 - **severity** (BLOCKING / COLLECTING),
 - **exemptions** of columns/elements (ERROR / WAIVED statuses),
 - the structured, bounded **report**,
@@ -409,8 +454,8 @@ the tabular format doesn't use.
 Introduce a **DataFormat** notion (CSV / XML) that groups, per format: its DataSource,
 its memory representation, and its set of structural rule implementations. The engine
 selects the DataFormat based on the input, then runs the same mechanics (catalog,
-phases, gate, report) on top. **None of this is coded in v1** — we only ensure these
-interfaces exist so that the XML v2 is an addition, not a rewrite.
+scope ordering, gate, report) on top. **None of this is coded in v1** — we only ensure
+these interfaces exist so that the XML v2 is an addition, not a rewrite.
 
 ---
 
@@ -423,19 +468,7 @@ interfaces exist so that the XML v2 is an addition, not a rewrite.
 | New report destination | new ReportSink | none |
 | New rule (existing logic) | row in the catalog | none |
 | New rule (brand-new logic) | type in the RuleRegistry | none |
-| Reorder / add a phase | phase configuration | none |
+| New rule nature (tree…) | `check_nature` value + implementation | none on execution |
 | Enable/disable a rule | catalog `enabled` field | none |
 | Exempt columns from a rule | catalog `exempted_columns` field | none |
 | New data format (XML) | new DataFormat (DataSource + structural rules) | core unchanged (cf. §8) |
-
----
-
-## 10. Areas to confirm / open decisions
-
-- **Strict or partial gate in the Structure phase**: does a file with an extra column
-  block everything, or do we tolerate some columns and continue on the others?
-- **CROSS policy on very large volumes**: acceptable memory bound for
-  duplicate/uniqueness rules (key materialization).
-- **Value of N** (size of error samples in the report).
-- **Remaining enumerated types** (`Currency`, `PriceMode`): exact constraints to
-  confirm (ISO 3-letter length? closed list?).

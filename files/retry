@@ -42,11 +42,12 @@ de simples implémentations branchables plus tard.
 formats d'entrée qui alimentent une même structure interne (liste de définitions de
 colonnes). Le reste du moteur ignore d'où vient le schéma.
 
-**Tout est règle, mais l'exécution est séquencée par phases.** La conformité
+**Tout est règle, mais l'exécution est ordonnée par scope.** La conformité
 structurelle (colonnes, types, obligatoires) et les règles métier partagent le même
-modèle d'objet et la même mécanique d'exécution. Ce qui les distingue, c'est une
-propriété de *phase* et une propriété de *sévérité*. Le moteur exécute les phases
-dans l'ordre ; une règle bloquante en échec empêche de passer à la phase suivante.
+modèle d'objet et la même mécanique d'exécution. Ce qui distingue leur ordre, c'est le
+*scope* (FILE avant DATAFRAME, cf. section 5) ; ce qui distingue leur criticité, c'est
+la *sévérité*. Le gate n'agit que sur les contrôles structurels : un contrôle
+structurel bloquant en échec empêche de valider les valeurs.
 
 ---
 
@@ -65,7 +66,7 @@ dans l'ordre ; une règle bloquante en échec empêche de passer à la phase sui
 │  (abstraite)  │ │ Parser   │ │ Catalog   │ │  Planner +   │ │   Builder       │
 │               │ │ (XSD/    │ │ Loader    │ │  Runner      │ │                 │
 │  → LazyFrame  │ │  JSON)   │ │           │ │              │ │  → ValidationRe │
-│    Polars     │ │ → Schema │ │ → Rule[]  │ │  (par phase, │ │    port (objet) │
+│    Polars     │ │ → Schema │ │ → Rule[]  │ │  (par scope, │ │    port (objet) │
 │               │ │  normal. │ │           │ │   par scope) │ │                 │
 └───────────────┘ └──────────┘ └───────────┘ └──────┬───────┘ └────────┬───────┘
                                                       │                   │
@@ -97,10 +98,11 @@ Completeness, Empty File, Readability…) à son implémentation. C'est le point
 d'extension : ajouter un nouveau type de règle = l'enregistrer ici. Le catalogue
 référence des types ; le registre sait les exécuter.
 
-**ExecutionPlanner + Runner.** Le planificateur organise les règles par *phase*
-(ordre d'exécution) puis, à l'intérieur d'une phase, les regroupe par *scope* pour
-minimiser le nombre de passes sur les 5 Go. Le runner exécute phase après phase,
-applique le gate bloquant, et transmet les résultats au ReportBuilder.
+**ExecutionPlanner + Runner.** Le planificateur regroupe les règles par *scope*
+d'exécution (FILE puis DATAFRAME) et, à l'intérieur du DATAFRAME, les empile en un
+minimum de passes vectorisées sur les 5 Go. Le runner exécute FILE puis DATAFRAME,
+applique le gate sur les contrôles structurels, et transmet les résultats au
+ReportBuilder.
 
 **ReportBuilder.** Agrège les résultats de toutes les règles en un objet
 `ValidationReport` structuré et lisible (section 4.3).
@@ -139,8 +141,10 @@ globales (nom/version du schéma, ordre attendu des colonnes).
 **Résolution de type (rôle du parseur XSD).** Trois familles observées dans le
 schéma réel, toutes ramenées à la même structure :
 
-1. **Énumérations** — `simpleType` avec `xs:enumeration` → `allowed_values`.
-   Ex. `YesNo`, `UnitType`, `Sign`, `Currency`, `PriceMode`.
+1. **Énumérations** — `simpleType` avec `xs:enumeration` → `allowed_values`, lues
+   **dynamiquement** depuis le XSD (aucune énumération codée en dur ; les valeurs
+   exactes ne comptent qu'aux tests). Ex. `YesNo`, `UnitType`, `Sign`, `Currency`,
+   `PriceMode`.
 2. **Décimaux à précision** — `simpleType` (ou restriction inline) avec
    `totalDigits`/`fractionDigits` → contraintes decimal.
    Ex. `decimal257` (25,7), `decimal259` (25,9), restrictions inline.
@@ -168,11 +172,21 @@ qui référence un type d'implémentation et porte ses paramètres.
   exécute la règle.
 - `dimension` : catégorie métier pour le reporting (Validity, Completeness,
   Integrity…).
-- `scope` : niveau d'application — `FILE`, `COLUMN`, `CELL`, `ROW`, `CROSS`
-  (mappé depuis « Applies To » : File / Fields).
-- `phase` : rang d'exécution (voir section 5). Détermine l'ordre et le gate.
-- `severity` : `BLOCKING` (rejet, arrêt du gate) ou `COLLECTING` (on note, on
-  continue). Mappé depuis « Action on Failure » (Reject → BLOCKING).
+- `scope` : scope d'**exécution** — `FILE` ou `DATAFRAME` (voir section 5).
+  - `FILE` : contrôles globaux effectués avant de toucher les données (lisibilité,
+    non-vide, conformité de l'en-tête, existence/type des colonnes).
+  - `DATAFRAME` : tout ce qui se calcule en passe(s) vectorisée(s) Polars sur les
+    données (valeurs de cellules, relations inter-colonnes, agrégats).
+- `check_nature` : **métadonnée descriptive** de la règle (n'influence pas l'exécution,
+  sert au rapport et au diagnostic) — `PER_CELL` (verdict par ligne : format,
+  énumération, non-vide), `CROSS_COLUMN` (relation inter-colonnes d'une même ligne :
+  `MatDt >= IssDt`), `COLUMN_AGGREGATE` (propriété d'une colonne entière : unicité,
+  taux d'échec global), `CROSS_AGGREGATE` (agrégat sur plusieurs colonnes/lignes :
+  unicité d'un couple, somme = X).
+- `severity` : `BLOCKING` (rejet, arrête le gate) ou `COLLECTING` (on note, on
+  continue). Mappé depuis « Action on Failure » (Reject → BLOCKING). N'agit comme gate
+  que pour les contrôles structurels (scope FILE / structure de colonnes) ; en scope
+  DATAFRAME (valeurs), tout est collecté sans coupure.
 - `threshold` : paramètre de tolérance (ex. `0 tolerance`, `min 1 data row`).
 - `params` : paramètres libres spécifiques au type de règle.
 - `enabled` : actif ou non (permet d'activer/désactiver via le catalogue).
@@ -186,10 +200,9 @@ qui référence un type d'implémentation et porte ses paramètres.
 - logique inédite → nouveau type enregistré dans le RuleRegistry, puis référencé
   depuis le catalogue. Le moteur ne change jamais.
 
-**Chaînage.** À l'intérieur d'une phase et d'un scope, les règles s'exécutent en
-séquence. Une règle `BLOCKING` en échec court-circuite la suite de la chaîne (les
-règles suivantes n'ont plus de sens) ; une règle `COLLECTING` laisse la chaîne
-continuer et ses erreurs s'agrègent.
+**Chaînage.** Les règles d'un même scope s'exécutent ensemble. En scope structurel, une
+règle `BLOCKING` en échec empêche de passer aux valeurs (gate). En scope DATAFRAME, les
+règles `COLLECTING` s'agrègent sans se couper.
 
 ### 4.3 ValidationReport
 
@@ -198,14 +211,15 @@ Objet structuré en mémoire, lisible, orienté « pourquoi le fichier est inval
 - `status` : `VALID` / `INVALID`.
 - `file_ref` : référence du fichier validé.
 - `schema_ref` : schéma utilisé (nom + version).
-- `stopped_at_phase` (optionnel) : phase où le gate a bloqué, le cas échéant.
+- `stopped_at` (optionnel) : le contrôle structurel où le gate a bloqué, le cas
+  échéant.
 - `summary` : compteurs globaux (nb d'erreurs, nb par sévérité, nb de lignes
   contrôlées, nb de lignes en erreur).
 - `diagnostic` : synthèse config-vs-données en tête de rapport (voir section 4.5) —
   agrège les signaux de toutes les règles pour indiquer, au premier coup d'œil, si
   l'échec ressemble à un problème de configuration ou à un fichier réellement invalide.
 - `results` : liste de résultats par règle, chacun avec :
-  - `rule_id`, `name`, `scope`, `severity`, `dimension`, `phase`
+  - `rule_id`, `name`, `scope`, `check_nature`, `severity`, `dimension`
   - `passed` : booléen (calculé sur les erreurs **non exemptées** uniquement)
   - `error_count` : erreurs réelles (comptent, peuvent bloquer)
   - `waived_count` : erreurs sur colonnes exemptées (tracées, neutralisées)
@@ -220,8 +234,9 @@ Objet structuré en mémoire, lisible, orienté « pourquoi le fichier est inval
 
 > **Bornage du rapport** : sur un fichier de 5 Go, une règle peut échouer sur des
 > millions de lignes. Le rapport conserve un **compteur exact** par règle + un
-> **échantillon borné** (top N erreurs) plutôt que la liste exhaustive, pour rester
-> exploitable et tenir en mémoire. Le seuil N est un paramètre du moteur.
+> **échantillon borné** aux N premières erreurs plutôt que la liste exhaustive, pour
+> rester exploitable et tenir en mémoire. N est un paramètre du moteur, **100 par
+> défaut** (ajustable, ex. mode debug plus verbeux).
 
 ### 4.4 Exemptions de colonnes (whitelist tracée)
 
@@ -295,23 +310,55 @@ signaux.
 
 ---
 
-## 5. Phases d'exécution
+## 5. Ordre d'exécution et gate (par scope)
 
-L'analyse du catalogue DQ fait émerger un ordre naturel, chaque niveau servant de
-*gate* au suivant. Les phases sont **ordonnées et paramétrables** (pas figées à deux).
+L'ordre d'exécution et les dépendances sont portés directement par le **scope
+d'exécution**, qui va du plus grossier au plus fin. Il n'existe qu'un seul axe
+d'organisation — le scope — et deux valeurs seulement :
 
-| Phase | Nom | Exemple de règle | Scope | Pourquoi c'est un gate |
-|-------|-----|------------------|-------|------------------------|
-| 0 | Lisibilité | DQ-003 Readability/Corruption | FILE | inutile de continuer si le fichier ne se parse pas |
-| 1 | Non-vide | DQ-002 Empty File | FILE | inutile de valider les colonnes d'un fichier sans données |
-| 2 | Structure | DQ-001a Schema Structure | FILE | inutile de valider les valeurs si les colonnes sont fausses |
-| 3 | Format + obligatoires | DQ-001b Field Format, DQ-001c Mandatory Fields | CELL/COLUMN | conformité au schéma avant le métier |
-| 4 | Métier | règles enrichies (catalogue vivant) | tous | n'a de sens que sur des données conformes |
+**1. `FILE`** — contrôles globaux effectués *avant* de traiter les données :
+- lisibilité / non-corruption (le fichier s'ouvre et se parse) ;
+- non-vide (au moins une ligne de données) ;
+- conformité de l'en-tête au schéma (bonnes colonnes, bon ordre) ;
+- existence et type déclaré des colonnes.
 
-Règle du gate : si une règle `BLOCKING` échoue dans une phase, on n'entre pas dans la
-phase suivante ; le rapport indique `stopped_at_phase`. Les règles `COLLECTING` ne
-bloquent pas la progression. Une règle `BLOCKING` dont toutes les erreurs sont
-`WAIVED` (colonnes exemptées, cf. 4.4) est considérée comme non bloquante.
+**2. `DATAFRAME`** — tout ce qui se calcule en passe(s) vectorisée(s) Polars sur les
+données, une fois la structure validée : valeurs de cellules (`PER_CELL`), relations
+inter-colonnes (`CROSS_COLUMN`), agrégats de colonne (`COLUMN_AGGREGATE`) et agrégats
+croisés (`CROSS_AGGREGATE`). Toutes ces natures se calculent dans la/les même(s)
+passe(s) — Polars parcourt la colonne une fois et applique plusieurs vérifications
+empilées ; distinguer cellule et colonne pour l'*exécution* serait artificiel.
+
+**Le gate agit uniquement sur les contrôles structurels — `FILE` et l'existence/type
+des colonnes.**
+
+- Si un contrôle `FILE` bloquant échoue (illisible, vide, en-tête non conforme), on
+  n'entre pas dans le scope `DATAFRAME` : valider des valeurs n'aurait pas de sens.
+- Au niveau colonne structurel : **toutes** les vérifications de structure de colonnes
+  sont exécutées d'abord (pour obtenir le panorama complet des colonnes en erreur), et
+  ce n'est *qu'ensuite* que le gate bloque le passage vers les vérifications de valeurs
+  si une colonne structurelle a échoué. On ne coupe pas à la première colonne fautive —
+  on veut voir toutes les colonnes cassées d'un coup (essentiel pour le diagnostic).
+- **En dessous, aucun gate** : les vérifications de valeurs (`PER_CELL`,
+  `CROSS_COLUMN`, agrégats) s'exécutent toutes en **collecte** — on évalue tout, on
+  agrège toutes les erreurs, rien ne coupe. C'est ce qui préserve l'exhaustivité et le
+  diagnostic config-vs-données (100 % d'une colonne, toutes colonnes en échec…).
+
+Ordre effectif : `FILE` (gate) → structure des colonnes (gate) → valeurs sur le
+`DATAFRAME` (collecte complète, sans gate).
+
+Le rapport indique `stopped_at` (le contrôle structurel qui a bloqué) le cas échéant.
+Une règle `BLOCKING` dont toutes les erreurs sont `WAIVED` (colonnes exemptées,
+cf. 4.4) est considérée comme non bloquante.
+
+> **Note.** La distinction cellule / inter-colonnes / agrégat n'est pas un scope
+> d'exécution mais une **métadonnée de règle** (`check_nature`, cf. 4.2). Elle ne
+> change pas *comment* on exécute (tout se fait en passe vectorisée sur le
+> `DATAFRAME`), mais elle indique au rapport et au diagnostic *comment interpréter* le
+> résultat : un verdict par ligne (liste de lignes fautives) ou un agrégat (propriété
+> de colonne, taux d'échec global). Polars fournit les deux dans la même passe :
+> l'expression booléenne par ligne donne le détail, un `.sum()`/`.all()`/`.n_unique()`
+> sur cette même expression donne l'agrégat.
 
 ---
 
@@ -324,18 +371,20 @@ bloquent pas la progression. Une règle `BLOCKING` dont toutes les erreurs sont
 4. **Ouverture de la source** : `DataSource` fournit un `LazyFrame` Polars en
    streaming depuis l'URI. Les colonnes decimal à précision sont typées en texte pour
    validation lexicale.
-5. **Planification** : les règles sont triées par phase, puis regroupées par scope à
-   l'intérieur de chaque phase.
-6. **Exécution par phase** :
-   - phase 0/1/2 (scope FILE) : contrôles globaux (parse OK, ≥1 ligne, en-tête
-     conforme au schéma).
-   - phase 3 (scope CELL/COLUMN/ROW) : **une seule passe vectorisée** regroupant un
-     maximum de règles en expressions Polars, pour ne pas relire les 5 Go par règle.
-   - phase 4 (métier) : idem pour cellule/colonne/ligne ; les règles CROSS (unicité,
-     doublons, agrégats) sont traitées à part avec les agrégats appropriés.
-   - après chaque phase, application du gate bloquant.
+5. **Planification** : les règles sont regroupées par scope d'exécution (FILE puis
+   DATAFRAME), et à l'intérieur du DATAFRAME empilées en un minimum de passes
+   vectorisées.
+6. **Exécution** :
+   - scope `FILE` : contrôles globaux (parse OK, ≥1 ligne, en-tête conforme, existence
+     et type des colonnes). Gate : un échec bloquant structurel arrête ici (toutes les
+     vérifications structurelles de colonnes sont toutefois exécutées avant de bloquer,
+     pour le panorama complet).
+   - scope `DATAFRAME` : **une seule passe** (ou le minimum) regroupant un maximum de
+     vérifications de valeurs en expressions Polars, pour ne pas relire les 5 Go par
+     règle. Aucun gate ici — collecte complète. (Les agrégats croisés `CROSS_AGGREGATE`
+     — unicité de couple, sommes — sont hors périmètre v1.)
 7. **Construction du rapport** : agrégation des résultats, compteurs, échantillons
-   bornés → `ValidationReport`.
+   bornés, diagnostic config-vs-données → `ValidationReport`.
 8. **Émission** : le rapport est remis au `ReportSink` (abstrait ici).
 
 ---
@@ -361,9 +410,10 @@ expressions Polars vectorisées** plutôt qu'en boucles Python.
   cellule/colonne/ligne au lieu d'une relecture par règle.
 - **Décimaux en texte** : validation lexicale de la précision, sans conversion float
   (justesse + compatibilité streaming).
-- **Règles CROSS isolées** : ce sont les seules coûteuses (matérialisation possible de
-  clés). Stratégies dédiées (agrégats streamables, hachage de clés) plutôt que
-  parallélisme manuel.
+- **Agrégats croisés hors v1** : les règles `CROSS_AGGREGATE` (unicité/doublons) — les
+  seules qui casseraient le streaming et poseraient un risque mémoire — ne sont pas
+  fournies en v1. La v1 reste donc entièrement streamable ; la nature `CROSS_AGGREGATE`
+  reste décrite comme point de couture pour un ajout ultérieur.
 - **Rapport borné** : compteurs exacts + échantillons, pas de liste exhaustive.
 
 ---
@@ -394,16 +444,18 @@ touche trois couches — et trois seulement.
   « Field Format » n'a pas la même implémentation sur un tableau plat et sur un arbre.
   Le RuleRegistry doit pouvoir associer un même *type de règle* à des implémentations
   **différentes selon le format**.
-- **Scopes** : les scopes actuels (CELL, COLUMN, ROW, CROSS) sont tabulaires. Le XML
-  ajoutera des scopes arborescents (NODE/ELEMENT, ATTRIBUTE, chemin, cardinalité d'un
-  élément répété…). Le modèle de scope doit rester ouvert (énumération extensible).
+- **Scopes** : le scope d'exécution actuel (`FILE`, `DATAFRAME`) et les natures de
+  règle tabulaires (`PER_CELL`, `CROSS_COLUMN`, `COLUMN_AGGREGATE`, `CROSS_AGGREGATE`)
+  sont pensés pour du tabulaire. Le XML ajoutera des natures arborescentes (NODE/ELEMENT,
+  ATTRIBUTE, chemin, cardinalité d'un élément répété…). Le modèle doit rester ouvert
+  (énumération extensible).
 
 ### 8.2 Ce qui reste commun (mutualisé, inchangé)
 
 Tout le cœur du moteur est indépendant du format et ne bouge pas :
 
 - le **catalogue de règles** (données) et son chargement,
-- le modèle de **phases + gate bloquant**,
+- le modèle d'**ordre par scope + gate structurel**,
 - la **sévérité** (BLOCKING / COLLECTING),
 - les **exemptions** de colonnes/éléments (statuts ERROR / WAIVED),
 - le **rapport** structuré et borné,
@@ -423,9 +475,9 @@ parent/enfant, cardinalités) que le format tabulaire n'utilise pas.
 Introduire une notion de **DataFormat** (CSV / XML) qui regroupe, par format : sa
 DataSource, sa représentation mémoire, et son jeu d'implémentations de règles
 structurelles. Le moteur sélectionne le DataFormat selon l'entrée, puis exécute la
-même mécanique (catalogue, phases, gate, rapport) par-dessus. **Rien de tout cela
-n'est codé en v1** — on s'assure seulement que ces interfaces existent pour que la v2
-XML soit un ajout, pas une réécriture.
+même mécanique (catalogue, ordre par scope, gate, rapport) par-dessus. **Rien de tout
+cela n'est codé en v1** — on s'assure seulement que ces interfaces existent pour que la
+v2 XML soit un ajout, pas une réécriture.
 
 ---
 
@@ -438,19 +490,7 @@ XML soit un ajout, pas une réécriture.
 | Nouvelle destination de rapport | nouveau ReportSink | aucun |
 | Nouvelle règle (logique existante) | ligne dans le catalogue | aucun |
 | Nouvelle règle (logique inédite) | type dans le RuleRegistry | aucun |
-| Réordonner / ajouter une phase | configuration des phases | aucun |
+| Nouvelle nature de règle (arborescente…) | valeur de `check_nature` + implémentation | aucun sur l'exécution |
 | Activer/désactiver une règle | champ `enabled` du catalogue | aucun |
 | Exempter des colonnes d'une règle | champ `exempted_columns` du catalogue | aucun |
 | Nouveau format de données (XML) | nouveau DataFormat (DataSource + règles structurelles) | cœur inchangé (cf. §8) |
-
----
-
-## 10. Zones à confirmer / décisions ouvertes
-
-- **Gate strict ou partiel en phase Structure** : un fichier avec une colonne en trop
-  bloque-t-il tout, ou tolère-t-on certaines colonnes en continuant sur les autres ?
-- **Politique CROSS sur très gros volume** : borne mémoire acceptable pour les règles
-  de doublons/unicité (matérialisation de clés).
-- **Valeur de N** (taille des échantillons d'erreurs dans le rapport).
-- **Types énumérés restants** (`Currency`, `PriceMode`) : contraintes exactes à
-  confirmer (longueur ISO 3 lettres ? liste fermée ?).

@@ -1,599 +1,361 @@
-# Moteur de validation CSV — Document de conception
+# Moteur de validation CSV — Fonctionnement
 
-**Version** : 1.0 — conception pure
-**Périmètre** : le moteur de validation uniquement. L'ingress (Kafka) et l'egress
-(destination du rapport) sont hors périmètre et représentés par des interfaces
-abstraites. Le moteur reçoit ses entrées et produit un objet rapport en mémoire.
+Le moteur valide un fichier CSV contre un schéma (XSD ou JSON) et une liste de règles,
+puis produit un rapport structuré indiquant si le fichier est valide et, sinon, le
+détail des erreurs. Ce document décrit son fonctionnement.
 
 ---
 
-## 1. Objectif et contraintes
+## 1. Ce que fait le moteur
 
-Le moteur valide un fichier CSV contre un schéma (XSD ou JSON) et un catalogue de
-règles de qualité de données, puis produit un rapport structuré indiquant si le
-fichier est valide et, sinon, la liste détaillée des erreurs.
+Il reçoit **trois entrées** et rend **un rapport** :
 
-Contraintes structurantes retenues pendant l'analyse :
+- une **référence de fichier CSV** (lu en flux depuis un stockage objet, ex. IBM COS) ;
+- un **schéma** (XSD ou JSON) décrivant les colonnes attendues et leurs types ;
+- une **liste de règles** à appliquer (la configuration).
 
-- **Volume** : fichiers jusqu'à ~5 Go. Traitement en flux (streaming), mémoire bornée.
-- **Pas d'écriture disque** : lecture en flux autorisée (depuis IBM COS, API S3),
-  aucune écriture de fichier temporaire. Tout le pipeline reste en mémoire / lazy.
+Il ne se connecte à rien : la source, le schéma et la liste de règles lui sont fournis
+en entrée ; le rapport est rendu en mémoire. La provenance des entrées et la destination
+du rapport sont hors périmètre.
+
+Contraintes structurantes :
+
+- **Volume** : fichiers jusqu'à ~5 Go, traités en flux, mémoire bornée.
+- **Pas d'écriture disque** : lecture en flux uniquement, tout le pipeline reste lazy.
 - **Polars** comme moteur d'exécution (lazy + streaming), pour le parallélisme natif
   (Rust, hors GIL) et la maîtrise mémoire.
-- **Extensibilité totale** : la *config* des règles à appliquer est une donnée (table
-  en base, passée en entrée), distincte de l'*implémentation* des types de règles (code,
-  dans le registre). On ajoute / active / désactive une règle en base sans modifier le
-  moteur ; une logique inédite s'ajoute par un nouveau type dans le code.
-- **Deux formats de schéma** : XSD (legacy) et JSON (v2), ramenés à une
-  représentation interne commune.
-- **Sévérité portée par la règle** : certaines règles sont bloquantes (arrêt), d'autres
-  collectantes (on note et on continue).
 
 ---
 
-## 2. Principes d'architecture
+## 2. Principes
 
-Trois principes gouvernent toute la conception.
+**Entrées / sorties découplées.** Le moteur ignore d'où viennent ses entrées et où va
+son rapport. Une source de données abstraite fournit le flux CSV ; un puits de rapport
+abstrait reçoit le résultat.
 
-**Découplage des entrées/sorties.** Le moteur ne connaît ni la provenance de ses
-entrées ni la destination de sa sortie. Une source de données abstraite fournit le
-flux CSV ; un puits de rapport abstrait reçoit le résultat. Kafka et COS deviennent
-de simples implémentations branchables plus tard.
+**Le schéma est normalisé.** XSD et JSON sont deux formats d'entrée ramenés à une même
+structure interne (liste de définitions de colonnes). Le reste du moteur ignore d'où
+vient le schéma.
 
-**Le schéma est une source de métadonnées normalisée.** XSD et JSON sont deux
-formats d'entrée qui alimentent une même structure interne (liste de définitions de
-colonnes). Le reste du moteur ignore d'où vient le schéma.
+**Tout est règle, l'exécution est ordonnée par scope.** Contrôles structurels et règles
+métier partagent le même modèle et la même mécanique. Le *scope* (`FILE` → `COLUMN` →
+`ROW` → `CROSS`) fixe l'ordre. En cas d'échec, deux attributs distincts et
+complémentaires décident de la suite : l'*action* (`REJECT` / `COLLECT`) fixe la
+**validité du fichier** ; le mode *strict* fixe l'**arrêt de l'exécution** (le gate). Une
+règle `REJECT` en échec rend le fichier invalide ; si elle est en plus `strict`, le gate
+bloque et les scopes suivants ne sont pas exécutés. Un fichier peut donc être déjà
+invalide tout en continuant d'être validé (pour tout collecter), tant qu'aucune règle
+`strict` n'a bloqué.
 
-**Tout est règle, mais l'exécution est ordonnée par scope.** La conformité
-structurelle (colonnes, types, obligatoires) et les règles métier partagent le même
-modèle d'objet et la même mécanique. Ce qui distingue leur ordre, c'est le *scope*
-(`FILE` → `COLUMN` → `ROW`, cf. section 5) ; ce qui distingue leur criticité, c'est
-la *sévérité*. Le gate n'agit qu'au scope `FILE` (contrôles structurels) : un contrôle
-structurel bloquant en échec empêche de descendre aux scopes suivants.
+**Code vs donnée.** L'*implémentation* d'un type de règle est du code (dans le
+registre) ; la *liste des règles* à appliquer est une donnée (reçue en entrée). On
+ajoute/active/désactive une règle sans toucher au moteur ; une logique inédite s'ajoute
+par un nouveau type dans le code.
 
 ---
 
-## 3. Vue d'ensemble des composants
+## 3. Composants
 
 ```
-                        ┌──────────────────────────────┐
-                        │        Orchestrateur          │
-                        │   (ValidationEngine)          │
-                        └──────────────┬───────────────┘
-                                       │ pilote le flux
-        ┌──────────────┬──────────────┼───────────────┬──────────────────┐
-        ▼              ▼              ▼               ▼                  ▼
-┌───────────────┐ ┌──────────┐ ┌───────────┐ ┌──────────────┐ ┌────────────────┐
-│  DataSource   │ │ Schema   │ │  Rule     │ │  Execution   │ │   Report        │
-│  (abstraite)  │ │ Parser   │ │ Catalog   │ │  Planner +   │ │   Builder       │
-│               │ │ (XSD/    │ │ Loader    │ │  Runner      │ │                 │
-│  → LazyFrame  │ │  JSON)   │ │           │ │              │ │  → ValidationRe │
-│    Polars     │ │ → Schema │ │ → Rule[]  │ │  (par scope, │ │    port (objet) │
-│               │ │  normal. │ │           │ │   par scope) │ │                 │
-└───────────────┘ └──────────┘ └───────────┘ └──────┬───────┘ └────────┬───────┘
-                                                      │                   │
-                                              ┌───────▼────────┐          │
-                                              │  Rule Registry │          │
-                                              │  (types de     │          ▼
-                                              │   règles       │   ┌──────────────┐
-                                              │   enregistrés) │   │ ReportSink   │
-                                              └────────────────┘   │ (abstraite)  │
-                                                                    └──────────────┘
+   CSV ref ─────► DataSource ───────┐
+   schéma ──────► SchemaParser ─────┤
+   règles ──────► CatalogLoader ────┤ (résout via RuleRegistry)
+                                     ▼
+                          ExecutionPlanner  (ordonne par scope)
+                                     ▼
+                              Runner  (exécute sur le LazyFrame, gate piloté par strict)
+                                     ▼
+                           ReportBuilder ───► ValidationReport
 ```
 
-### Responsabilités
+- **DataSource** — ouvre le CSV en flux (LazyFrame Polars). Abstraite : COS, S3, fichier
+  local sont des implémentations.
+- **SchemaParser** — lit le XSD ou le JSON et produit le schéma normalisé ; déduit aussi
+  la validation technique par colonne (cf. §4).
+- **CatalogLoader** — transforme la liste de règles reçue en objets `Rule` exécutables,
+  en résolvant chaque `rule_type` via le **RuleRegistry**.
+- **RuleRegistry** — bibliothèque des types de règles : pour chaque `rule_type`, son
+  implémentation Polars **et** son scope.
+- **ExecutionPlanner** — ordonne les règles par scope et empile les vérifications en un
+  minimum de passes. Ne touche pas aux données.
+- **Runner** — déroule le plan sur le LazyFrame, applique le gate (arrêt si une règle
+  `REJECT` + `strict` échoue), collecte les résultats.
+- **ReportBuilder** — agrège les résultats en un `ValidationReport`.
 
-**DataSource (abstraite).** Fournit le CSV sous forme de `LazyFrame` Polars, en
-streaming depuis une URI (COS/S3, fichier local pour les tests…). Ne charge jamais
-tout en mémoire. Une implémentation concrète par backend de stockage.
+L'orchestrateur est le seul à connaître tous les composants ; ils ne se parlent pas
+entre eux. Chacun a un contrat clair (une entrée, une sortie), ce qui le rend
+remplaçable indépendamment.
 
-**SchemaParser (XSD / JSON).** Lit le schéma et produit un *schéma normalisé*
-(section 4.1). Deux implémentations interchangeables derrière une interface commune ;
-un sélecteur choisit selon le format d'entrée. Résout les types nommés et les facettes.
+### Détail des composants
 
-**RuleCatalogLoader.** La liste des règles à appliquer est fournie **en entrée du
-moteur** (au même titre que le CSV et le schéma). En amont, cette liste provient
-typiquement d'une **table de configuration en base** que le composant appelant lit et
-transmet au moteur ; le moteur, lui, ne connaît pas la base — il reçoit juste la liste.
-Le loader la **désérialise/mappe** en objets `Rule` (section 4.2) et filtre sur les
-règles actives. Il ne contient aucune logique de validation.
+Pour chaque composant : son rôle, son entrée → sortie, et ses champs clés.
 
-**RuleRegistry.** Table qui associe chaque *type de règle* (Structural, Format,
-Completeness, Empty File, Readability…) à son implémentation. C'est le point
-d'extension : ajouter un nouveau type de règle = l'enregistrer ici. Le catalogue
-référence des types ; le registre sait les exécuter.
+**DataSource** (interface)
+- *Rôle* : ouvrir le fichier en flux, sans le charger en mémoire.
+- *Entrée → sortie* : `open(reference, read_options)` → `LazyFrame` Polars.
+- *Champs* : `reference` (URI du fichier dans le stockage objet), `read_options`
+  (délimiteur, encodage, présence d'en-tête, guillemets…).
+- *Implémentations* : COS, S3, fichier local.
 
-**ExecutionPlanner.** Prend la liste plate de `Rule` et l'**organise pour l'exécution**
-sans toucher aux données : il regroupe les règles par *scope* (`FILE` → `COLUMN` →
-`ROW` → `CROSS`) pour respecter l'ordre de dépendance, et dans chaque scope portant sur
-les données, il **empile** les vérifications pour qu'elles tiennent en un minimum de
-passes Polars. C'est aussi ici que se joue l'activation de la validation technique : si
-une règle `check-types` (scope `COLUMN`) est présente, le planificateur demande au
-parseur les validateurs de type déduits du XSD et les ajoute au plan ; sinon il ne les
-ajoute pas. Le résultat est un *plan d'exécution* — quoi faire, dans quel ordre, groupé
-comment. Rien n'a encore touché les 5 Go.
+**SchemaParser** (interface)
+- *Rôle* : lire le schéma et le normaliser ; déduire la validation technique par colonne.
+- *Entrée → sortie* : `parse(schema_reference)` → `NormalizedSchema`.
+- *Implémentations* : `XsdSchemaParser`, `JsonSchemaParser`.
 
-**Runner.** Déroule le plan scope par scope, sur le `LazyFrame`. Pour chaque règle, il
-demande au `RuleRegistry` l'implémentation du `rule_type` ; ces implémentations
-construisent les expressions Polars, que le Runner évalue sur le `LazyFrame`. Grâce à
-l'empilement du plan, plusieurs règles d'un même scope sont évaluées en **une seule
-passe vectorisée** (levier de perf sur 5 Go — sinon N règles = N relectures). Le Runner
-applique le **gate** après le scope `FILE` (un contrôle structurel bloquant en échec
-empêche d'entrer dans les scopes suivants) et collecte les résultats bruts (lignes /
-colonnes en échec, compteurs) qu'il transmet au ReportBuilder.
+**NormalizedSchema** (structure) — liste ordonnée de `ColumnDefinition` :
+- `order` : position attendue de la colonne (0, 1, 2…). Sert au contrôle structurel
+  `FILE` à vérifier **l'ordre des colonnes** de l'en-tête, pas seulement leur présence.
+- `name` : nom de la colonne (sert à l'appariement avec l'en-tête CSV).
+- `base_type` : type normalisé (`string`, `date`, `decimal`, `integer`…).
+- `nullable` : la colonne accepte-t-elle le vide (`nillable` du XSD) ; si `false`, la
+  cellule est obligatoire.
+- `constraints` : contraintes déduites — `max_length`, `total_digits`,
+  `fraction_digits`, `allowed_values` (énumération), `format` (date). C'est ce qui
+  alimente la validation technique.
 
-> La séparation Planner / Runner isole **la décision** (quoi faire, dans quel ordre) de
-> **l'action** (l'exécuter sur les données). Un plan peut être vérifié sans exécuter, et
-> la stratégie d'exécution peut évoluer sans toucher à la logique d'ordonnancement.
+**CatalogLoader**
+- *Rôle* : transformer la liste de règles de config en règles exécutables.
+- *Entrée → sortie* : `load(raw_rules, registry)` → `Rule[]`.
+- *Traitement* : pour chaque entrée, résout le `rule_type` via le registre (implémentation
+  + scope) et l'assemble avec `action`, `params`, `exempted_columns`.
 
-**ReportBuilder.** Agrège les résultats de toutes les règles en un objet
-`ValidationReport` structuré et lisible (section 4.3).
+**Rule** (structure) — objet exécutable produit par le CatalogLoader (détail des champs
+en §5) :
+- `rule_id` : identifiant unique.
+- `rule_type` : clé vers le registre ; porte le scope et la nature du verdict.
+- `action` : `REJECT` / `COLLECT` — validité du fichier.
+- `strict` : `true` / `false` — arrêt de l'exécution (gate).
+- `params` : paramètres du type (seuils, colonnes, opérandes…).
+- `exempted_columns` : colonnes exemptées (scope `COLUMN` uniquement, optionnel).
+- `enabled` : règle active ou non.
 
-**ReportSink (abstraite).** Reçoit le rapport final. Hors périmètre pour
-l'implémentation ; existe seulement comme interface (un `InMemorySink` suffit pour
-tester).
+**RuleRegistry**
+- *Rôle* : bibliothèque des types de règles disponibles (code).
+- *Entrée → sortie* : `resolve(rule_type)` → `(implementation, scope)`.
+- *Champs par entrée* : `rule_type` (clé), `implementation` (fonction qui construit
+  l'expression Polars), `scope` (FILE/COLUMN/ROW/CROSS), nature du verdict (par ligne ou
+  agrégat).
 
----
+**ExecutionPlanner**
+- *Rôle* : décider quoi exécuter, dans quel ordre, groupé comment — sans toucher aux
+  données.
+- *Entrée → sortie* : `plan(rules, schema)` → `ExecutionPlan`.
+- *Champs de l'`ExecutionPlan`* : règles groupées par `scope`, passes vectorisées
+  empilées, validateurs techniques du XSD injectés si `check-types` est présente.
 
-## 4. Modèle de données
+**Runner**
+- *Rôle* : exécuter le plan sur les données et appliquer le gate.
+- *Entrée → sortie* : `run(plan, lazyframe)` → résultats bruts par règle.
+- *Champs des résultats bruts* : par règle, les lignes/colonnes en échec, les compteurs,
+  et le statut de gate (une règle `REJECT` + `strict` en échec arrête l'exécution).
 
-### 4.1 Schéma normalisé
+**ReportBuilder**
+- *Rôle* : agréger les résultats bruts en rapport final.
+- *Entrée → sortie* : `build(raw_results)` → `ValidationReport` (cf. §7).
 
-Produit par les parseurs, consommé par le moteur. Indépendant du format source.
-
-**Schéma** : une collection ordonnée de définitions de colonnes + des métadonnées
-globales (nom/version du schéma, ordre attendu des colonnes).
-
-**ColumnDefinition** (une par colonne du CSV) :
-
-- `name` : nom de la colonne (ex. `InstrmtName`).
-- `base_type` : type de base résolu — `string`, `decimal`, `integer`,
-  `positive_integer`, `date`, `datetime`.
-- `nullable` : la cellule peut-elle être vide ? (dérivé de `nillable`).
-- `constraints` : ensemble de facettes normalisées, selon le type :
-  - string → `max_length`, éventuellement `pattern`
-  - decimal → `total_digits`, `fraction_digits`
-  - énumération → `allowed_values` (ex. `YesNo` → {Y, N}, `UnitType` → {U, V, C},
-    `Sign` → {+, −})
-  - date/datetime → `format` attendu
-- `semantic_type` (optionnel) : étiquette sémantique issue des types nommés
-  (`Price`, `Qty`, `Amt`, `PriceOffset`…), sans contrainte forte mais utile au
-  reporting et à d'éventuelles règles métier.
-
-**Résolution de type (rôle du parseur XSD).** Trois familles observées dans le
-schéma réel, toutes ramenées à la même structure :
-
-1. **Énumérations** — `simpleType` avec `xs:enumeration` → `allowed_values`, lues
-   **dynamiquement** depuis le XSD (aucune énumération codée en dur ; les valeurs
-   exactes ne comptent qu'aux tests). Ex. `YesNo`, `UnitType`, `Sign`, `Currency`,
-   `PriceMode`.
-2. **Décimaux à précision** — `simpleType` (ou restriction inline) avec
-   `totalDigits`/`fractionDigits` → contraintes decimal.
-   Ex. `decimal257` (25,7), `decimal259` (25,9), restrictions inline.
-3. **Types sémantiques libres** — `simpleType` alias d'un type de base sans facette
-   (`Price`, `Qty`, `Amt` → decimal libre) → `base_type` + `semantic_type`.
-
-Le parseur fait deux passes : (1) collecte tous les `simpleType` nommés globaux dans
-une table de types ; (2) résout chaque colonne contre cette table, en fusionnant avec
-d'éventuelles restrictions inline.
-
-> **Point de justesse decimal** : `total_digits=25` dépasse la précision d'un float64
-> (~15–17 chiffres). Pour *valider* la précision, la colonne doit être lue en **texte
-> brut** et vérifiée lexicalement (analyse de la chaîne), et non convertie en float.
-> C'est à la fois plus juste et compatible streaming.
-
-**Validation technique déduite du XSD.** À partir du type et des contraintes d'une
-colonne, le parseur **déduit la validation technique** de cette colonne — le « contrat
-structurel » que la valeur doit respecter. Correspondance type → validation :
-
-| Type XSD | Contrainte normalisée | Validation (scope COLUMN) |
-|----------|----------------------|---------------------------|
-| `xs:date` / `xs:dateTime` | `format` attendu | la valeur parse selon le format |
-| `xs:decimal` + `totalDigits`/`fractionDigits` | précision | validation lexicale sur texte : décimal valide, chiffres ≤ totalDigits, décimales ≤ fractionDigits |
-| `xs:integer` / `xs:positiveInteger` | entier (> 0) | la valeur est un entier (positif) |
-| `xs:string` + `maxLength` | longueur max | longueur ≤ maxLength |
-| énuméré (`YesNo`, `UnitType`…) | `allowed_values` | la valeur ∈ ensemble lu dans le XSD |
-| `nillable="false"` | obligatoire | cellule non-vide (règle Mandatory) |
-
-Le `nillable` est **transversal au type** : une colonne `nillable="true"` de type
-`xs:date` signifie « vide OU date valide » — la validation de type ne s'applique qu'aux
-valeurs non-vides.
-
-**Activation par la liste des règles (`check-types`).** La validation technique n'est
-pas exécutée automatiquement : elle est **pilotée par la présence d'une règle
-`check-types`** (globale, scope `COLUMN`) dans la liste des règles à appliquer. Si
-`check-types` est présente, le parseur déduit et charge les validateurs de type pour
-toutes les colonnes depuis le XSD, et le moteur les applique. Si elle est absente,
-aucune validation technique n'est faite. Le XSD fournit *le matériau* (les types) ; la
-règle dans la liste *active* son exploitation. Une seule règle `check-types` suffit —
-le détail par colonne vient du XSD, pas de la liste.
-
-On distingue ainsi la **validation technique** (déduite du XSD, activée par
-`check-types`) de la **validation métier** (déclarée explicitement dans la table de
-config). Les deux vivent dans la même liste de règles et passent par le même moteur.
-
-### 4.2 Objet Rule
-
-Directement calqué sur le catalogue DQ. Une règle est une **donnée de configuration**
-qui référence un type d'implémentation et porte ses paramètres.
-
-- `rule_id` : identifiant unique (ex. `DQ-001a`).
-- `name` : libellé (ex. « Schema Structure »).
-- `rule_type` : type technique → clé dans le RuleRegistry (Structural, Format,
-  Completeness, EmptyFile, Readability…). C'est ce qui dit *quelle implémentation*
-  exécute la règle.
-- `dimension` : catégorie métier pour le reporting (Validity, Completeness,
-  Integrity…).
-- `scope` : scope d'**exécution** — `FILE`, `COLUMN`, `ROW` ou `CROSS` (voir section 5).
-  - `FILE` : contrôles globaux effectués avant de toucher les données (lisibilité,
-    non-vide, conformité de l'en-tête, existence/type des colonnes).
-  - `COLUMN` : vérifications colonne par colonne — dont la validation technique déduite
-    du XSD (format, longueur, énumération, obligatoire).
-  - `ROW` : vérifications croisant plusieurs colonnes d'une même ligne
-    (ex. `MatDt >= IssDt`).
-  - `CROSS` : vérifications croisant plusieurs **lignes** entre elles (unicité,
-    doublons, agrégats globaux). **Décrit mais non implémenté en v1** (cf. section 5).
-- `check_nature` : **métadonnée descriptive** de la règle (n'influence pas l'exécution,
-  sert au rapport et au diagnostic) — `PER_CELL` (verdict par ligne : format,
-  énumération, non-vide), `CROSS_COLUMN` (relation inter-colonnes d'une même ligne :
-  `MatDt >= IssDt`), `COLUMN_AGGREGATE` (propriété d'une colonne entière : unicité,
-  taux d'échec global), `CROSS_AGGREGATE` (agrégat sur plusieurs colonnes/lignes :
-  unicité d'un couple, somme = X).
-- `severity` : `BLOCKING` (rejet, arrête le gate) ou `COLLECTING` (on note, on
-  continue). Mappé depuis « Action on Failure » (Reject → BLOCKING). N'agit comme gate
-  qu'au scope `FILE` (contrôles structurels) ; aux scopes `COLUMN` et `ROW`, tout est
-  collecté sans coupure.
-- `threshold` : paramètre de tolérance (ex. `0 tolerance`, `min 1 data row`).
-- `params` : paramètres libres spécifiques au type de règle.
-- `enabled` : actif ou non (permet d'activer/désactiver via le catalogue).
-- `target_columns` (optionnel) : colonnes concernées, sinon toutes.
-- `exempted_columns` (optionnel) : whitelist de colonnes exemptées de cette règle
-  (voir section 4.4). **Valide uniquement au scope `COLUMN`** — exempter une colonne n'a
-  de sens que pour une règle qui raisonne colonne par colonne (sans objet au scope
-  `FILE`, global, ou `ROW`, inter-colonnes). Les colonnes exemptées sont **quand même
-  testées**, mais leurs erreurs sont neutralisées (tracées, non bloquantes).
-
-**Deux « catalogues » distincts : implémentation en code, configuration en base.** Il
-faut distinguer *ce qu'une règle sait faire* (le code) de *quelles règles on applique
-sur un fichier donné* (la donnée). Ce sont deux choses stockées à deux endroits :
-
-- **Le catalogue des types de règles → dans le code (RuleRegistry).** L'implémentation
-  d'un `rule_type` (sa logique Polars : comment vérifier un format, une complétude, une
-  structure) est du code, enregistrée dans le registre. Elle ne varie pas d'un fichier
-  CSV à l'autre. C'est la bibliothèque des types *disponibles*.
-- **La configuration des règles à appliquer → dans une base (table), lue en amont.**
-  Quelles règles concrètes on applique sur un flux/fichier donné, avec leurs paramètres
-  (colonne cible, format attendu, seuil, sévérité, colonnes exemptées, `enabled`…), est
-  de la **donnée** stockée en table. Chaque ligne référence un `rule_type` (une simple
-  chaîne, ex. `"Format"`) et porte ses paramètres. La table ne contient **aucune
-  logique**, juste des références + des paramètres. **Le moteur ne se connecte pas à la
-  base** : c'est le composant appelant qui lit la table et passe la liste de
-  configuration (règles + paramètres) **en entrée du moteur**. Le moteur ne sait pas
-  qu'une base existe — il reçoit juste la liste.
-
-Les deux se rencontrent au runtime : pour chaque règle de la liste reçue, le
-`rule_type` (une chaîne) est résolu vers son implémentation dans le registre.
-
-Exemple de ligne de config en table : « type `Format`, colonne `IssDt`, format attendu
-`YYYY-MM-DD`, sévérité bloquante, activée ». Le mot `Format` est une référence ;
-l'implémentation qui parse la date et marque les lignes fautives est dans le code. On
-peut ajouter des dizaines de lignes de ce genre en table sans écrire une ligne de code,
-tant qu'elles réutilisent des `rule_type` déjà implémentés.
-
-**Extensibilité.** Ajouter une règle a deux formes possibles :
-- même logique, autre configuration → **nouvelle ligne dans la table de config**, rien
-  à coder (réutilise un `rule_type` existant).
-- logique inédite → **nouveau type enregistré dans le RuleRegistry** (code), puis
-  référençable depuis la table. Le moteur ne change jamais.
-
-**Chaînage.** Les règles d'un même scope s'exécutent ensemble. Au scope `FILE`, une
-règle `BLOCKING` en échec empêche de descendre aux scopes suivants (gate). Aux scopes
-`COLUMN` et `ROW`, les règles s'agrègent en collecte, sans se couper.
-
-### 4.3 ValidationReport
-
-Objet structuré en mémoire, lisible, orienté « pourquoi le fichier est invalide ».
-
-- `status` : `VALID` / `INVALID`.
-- `file_ref` : référence du fichier validé.
-- `schema_ref` : schéma utilisé (nom + version).
-- `stopped_at` (optionnel) : le contrôle structurel où le gate a bloqué, le cas
-  échéant.
-- `summary` : compteurs globaux (nb d'erreurs, nb par sévérité, nb de lignes
-  contrôlées, nb de lignes en erreur).
-- `diagnostic` : synthèse config-vs-données en tête de rapport (voir section 4.5) —
-  agrège les signaux de toutes les règles pour indiquer, au premier coup d'œil, si
-  l'échec ressemble à un problème de configuration ou à un fichier réellement invalide.
-- `results` : liste de résultats par règle, chacun avec :
-  - `rule_id`, `name`, `scope`, `check_nature`, `severity`, `dimension`
-  - `passed` : booléen (calculé sur les erreurs **non exemptées** uniquement)
-  - `error_count` : erreurs réelles (comptent, peuvent bloquer)
-  - `waived_count` : erreurs sur colonnes exemptées (tracées, neutralisées)
-  - `failure_rate` : part des cellules/lignes contrôlées en échec (0.0 à 1.0)
-  - `diagnostic_hint` : indice config-vs-données hiérarchisé par confiance
-    (`LIKELY_CONFIG`, `LIKELY_DATA`, `INCONCLUSIVE`) — voir section 4.5
-  - `errors` : échantillon détaillé et **borné** (voir ci-dessous) — colonne, n° de
-    ligne le cas échéant, valeur fautive, message expliquant l'attendu vs le constaté,
-    et un statut (`ERROR` ou `WAIVED`).
-  - `exempted_columns` : colonnes exemptées pour cette règle, avec leur `waived_count`
-    respectif (traçabilité : « ce qui aurait échoué »).
-
-> **Bornage du rapport** : sur un fichier de 5 Go, une règle peut échouer sur des
-> millions de lignes. Le rapport conserve un **compteur exact** par règle + un
-> **échantillon borné** aux N premières erreurs plutôt que la liste exhaustive, pour
-> rester exploitable et tenir en mémoire. N est un paramètre du moteur, **100 par
-> défaut** (ajustable, ex. mode debug plus verbeux).
-
-### 4.4 Exemptions de colonnes (whitelist tracée)
-
-Besoin : pour une règle donnée, exempter certaines colonnes tout en gardant une trace
-de ce qui aurait échoué (audit). Portée : **colonnes uniquement**. Mode : **testé mais
-neutralisé** (les colonnes exemptées sont bien évaluées, mais leurs erreurs ne comptent
-pas et ne bloquent pas).
-
-Conséquence sur le modèle : une erreur porte un **statut**, pas juste un booléen.
-
-- `ERROR` : erreur sur une colonne non exemptée → comptée, peut déclencher le gate.
-- `WAIVED` : erreur sur une colonne exemptée → tracée dans le rapport, **neutralisée**
-  (n'invalide pas le fichier, ne déclenche pas le gate).
-
-Comportement :
-
-- **L'exemption ne s'applique qu'aux règles de scope `COLUMN`.** Exempter une colonne
-  suppose une règle qui évalue les colonnes une par une ; c'est sans objet au scope
-  `FILE` (contrôle global du fichier) ou `ROW` (croisement inter-colonnes d'une ligne).
-  Un `exempted_columns` sur une règle non-`COLUMN` est ignoré (ou signalé en
-  configuration).
-- La whitelist vit sur la règle (`exempted_columns`), au plus près de la configuration
-  du catalogue.
-- Le moteur **teste** les colonnes exemptées comme les autres (le calcul est fait),
-  puis reclasse leurs erreurs en `WAIVED`.
-- Le `passed` d'une règle et le gate bloquant se calculent sur les erreurs `ERROR`
-  seulement. Une règle `BLOCKING` dont **toutes** les erreurs sont `WAIVED` ne bloque
-  pas.
-- Le rapport expose `error_count`, `waived_count`, et le détail par colonne exemptée —
-  on voit donc l'impact réel de l'exemption et on peut décider de la retirer plus tard
-  en connaissance de cause.
-
-> Coût : le mode « testé mais neutralisé » implique que le calcul de validation est
-> bien exécuté sur les colonnes exemptées (pas d'économie de calcul), contrairement à
-> un mode « non testé » qui les sortirait du périmètre. C'est le prix de la
-> traçabilité demandée.
-
-### 4.5 Diagnostic « config vs données »
-
-Objectif : quand la validation échoue massivement, aider le lecteur à savoir si le
-problème vient d'une **mauvaise configuration** (mauvais schéma, mauvais format de date
-attendu, mauvais séparateur, mauvais encoding…) ou d'un **fichier réellement
-invalide**. Sans ce diagnostic, un rapport qui dit « fichier invalide » envoie les gens
-chasser un problème de données qui est en fait un problème de config.
-
-**Principe : le moteur suggère, il n'affirme pas.** Il ne peut pas *prouver* que la
-config est fausse ; il expose des **indices hiérarchisés par confiance**. Le fichier
-reste marqué INVALID (les règles ont échoué, c'est un fait), mais le rapport oriente la
-recherche. La décision reste humaine.
-
-**Signatures détectées (socle fiable, calculé à partir des compteurs existants) :**
-
-- **Header mismatch** — les noms de colonnes du fichier ne correspondent pas au schéma.
-  Confiance : quasi-certain que c'est la config (mauvais schéma ou mauvais fichier).
-- **Toutes les colonnes en échec simultanément** — signature typique d'un mauvais
-  séparateur, encoding, ou décalage d'en-tête. Confiance : très probable config.
-- **100 % d'échec sur une colonne** — toute la colonne viole la même règle (ex. dates
-  en `DD/MM/YYYY` alors que le schéma attend `YYYY-MM-DD`). Confiance : probable config.
-- **Échec partiel et épars** — une règle échoue sur une petite fraction de lignes de
-  façon dispersée. Confiance : probable données (vraies erreurs — ce qu'on veut rejeter).
-
-**Deux niveaux d'exposition :**
-
-- **Par règle** (`diagnostic_hint` + `failure_rate`) : pour creuser — quelle règle,
-  quelle colonne porte le signal.
-- **Global** (`diagnostic` en tête de rapport) : pour le premier coup d'œil — agrège
-  les signaux des règles en un message clair (« plusieurs signaux suggèrent un problème
-  de configuration : séparateur ? schéma ? format de date ? » vs « les échecs
-  ressemblent à de vraies erreurs de données »).
-
-**Extensibilité.** Le socle calcule des signaux bruts robustes (taux d'échec,
-100 %-colonne, toutes-colonnes, header-mismatch). Une couche d'interprétation les
-traduit en hypothèses lisibles (« mauvais séparateur probable », « format de date mal
-configuré »). Les messages peuvent être enrichis plus tard sans retoucher le calcul des
-signaux.
+**ReportSink** (interface, hors périmètre v1)
+- *Rôle* : recevoir le rapport (fichier, file de messages, appelant…).
+- *Entrée → sortie* : `emit(report)` → void.
 
 ---
 
-## 5. Ordre d'exécution et gate (par scope)
+## 4. Le schéma et la validation technique
 
-L'ordre d'exécution et les dépendances sont portés directement par le **scope
-d'exécution**, qui va du plus grossier au plus fin. Trois scopes, exécutés dans
-l'ordre :
+Le `SchemaParser` ramène XSD et JSON à une **définition de colonne** commune :
+`{ name, base_type, nullable, constraints }`. Le moteur ne voit que cette forme
+normalisée.
 
-**1. `FILE`** — contrôles globaux effectués *avant* de traiter les données :
-- lisibilité / non-corruption (le fichier s'ouvre et se parse) ;
-- non-vide (au moins une ligne de données) ;
-- conformité de l'en-tête au schéma (bonnes colonnes, bon ordre) ;
-- existence et type déclaré des colonnes.
+À partir du type et des contraintes d'une colonne, le parseur **déduit sa validation
+technique** — le contrat que la valeur doit respecter :
 
-**2. `COLUMN`** — vérifications colonne par colonne : la **validation technique déduite
-du XSD** (format, longueur, énumération, obligatoire selon `nillable`) activée par la
-règle `check-types` (cf. section 4.1), et tout contrôle portant sur une colonne. Ces
-vérifications se calculent en expressions Polars vectorisées, empilées en un minimum de
-passes.
+| Type XSD | Contrainte | Validation | Activée par |
+|----------|-----------|------------|-------------|
+| `xs:date` / `xs:dateTime` | format | la valeur parse selon le format | `check-types` |
+| `xs:decimal` + `totalDigits`/`fractionDigits` | précision | validation lexicale sur texte : chiffres ≤ totalDigits, décimales ≤ fractionDigits | `check-types` |
+| `xs:integer` | entier | la valeur est un entier | `check-types` |
+| `xs:string` + `maxLength` | longueur | longueur ≤ maxLength | `check-types` |
+| énuméré (`YesNo`, `UnitType`…) | valeurs permises | la valeur ∈ ensemble lu dans le XSD | `check-types` |
+| `nillable="false"` | obligatoire | cellule non-vide | `MandatoryFields` |
 
-**3. `ROW`** — vérifications croisant plusieurs colonnes d'une **même ligne**
-(ex. `MatDt >= IssDt`, ou « si `FloatingRtFlag = Y` alors `RefixFrq` renseigné »).
-Également vectorisées, elles combinent plusieurs colonnes dans l'expression.
+Le `nillable` est transversal : une colonne `nillable="true"` de type date signifie
+« vide OU date valide ».
 
-**4. `CROSS`** — vérifications croisant plusieurs **lignes** entre elles (unicité d'une
-colonne, doublons sur un couple, agrégats globaux type somme = X). Elles ont besoin de
-voir tout le dataset. **Décrit mais non implémenté en v1** : c'est le seul scope qui
-casserait le streaming pur et poserait un risque mémoire (matérialisation de clés). Le
-scope reste dans le modèle comme point de couture ; aucune règle `CROSS` n'est fournie
-en v1.
+**Deux règles XSD-alimentées.** La validation technique n'est pas automatique : elle est
+activée par la présence de règles dédiées dans la liste, chacune avec ses propres
+`action` et `strict`. Le XSD fournit le matériau ; la règle active son exploitation.
 
-**Le gate agit uniquement au scope `FILE` (contrôles structurels).**
+- `check-types` (scope COLUMN) — active le contrôle de **type, longueur, énumération,
+  format** sur toutes les colonnes, d'après le XSD.
+- `MandatoryFields` (scope COLUMN) — active le contrôle d'**obligatoire** (cellule
+  non-vide) sur les colonnes `nillable="false"`, d'après le XSD.
 
-- Si un contrôle `FILE` bloquant échoue (illisible, vide, en-tête non conforme,
-  colonne manquante ou mal typée), on **n'entre pas** dans les scopes `COLUMN`/`ROW` :
-  valider des valeurs n'aurait pas de sens. Toutes les vérifications structurelles du
-  scope `FILE` sont toutefois exécutées avant de bloquer, pour livrer le panorama
-  complet des anomalies de structure (essentiel pour le diagnostic).
-- **Aux scopes `COLUMN` et `ROW`, aucun gate** : les vérifications s'exécutent toutes en
-  **collecte** — on évalue tout, on agrège toutes les erreurs, rien ne coupe. C'est ce
-  qui préserve l'exhaustivité et le diagnostic config-vs-données (100 % d'une colonne,
-  toutes colonnes en échec…).
+Séparer les deux permet de les traiter différemment (ex. `MandatoryFields` en `REJECT` +
+`strict`, `check-types` en `REJECT` non-`strict`) ou d'activer l'un sans l'autre. Toutes
+deux se distinguent de la validation **métier** déclarée en config (ex. `MatDt >= IssDt`).
 
-Ordre effectif : `FILE` (gate structurel) → `COLUMN` (collecte) → `ROW` (collecte)
-→ `CROSS` (collecte, non implémenté v1).
+**Principe général : le scope COLUMN est alimenté par le XSD.** C'est au scope COLUMN que
+les règles puisent naturellement leurs paramètres dans le schéma (type, longueur,
+énumération, format, obligatoire) plutôt que dans la config — parce que le XSD décrit
+précisément les colonnes. `check-types` et `MandatoryFields` en sont les cas types ; toute
+validation par colonne déduite du schéma suit le même mode d'alimentation. (Le XSD
+alimente aussi la structure au scope `FILE` : liste et ordre des colonnes. À l'inverse,
+une règle COLUMN peut rester purement métier, avec ses paramètres en config — d'où
+« généralement ».)
 
-Le rapport indique `stopped_at` (le contrôle structurel qui a bloqué) le cas échéant.
-Une règle `BLOCKING` dont toutes les erreurs sont `WAIVED` (colonnes exemptées,
-cf. 4.4) est considérée comme non bloquante.
-
-> **Note — scope vs check_nature.** Le `scope` détermine *quand/où* une règle s'exécute
-> (`FILE` → `COLUMN` → `ROW`). La `check_nature` (cf. 4.2) est une métadonnée qui
-> indique au rapport et au diagnostic *comment interpréter* le résultat : un verdict par
-> ligne (liste de lignes fautives) ou un agrégat (propriété de colonne, taux d'échec
-> global). Polars fournit les deux dans la même passe : l'expression booléenne par ligne
-> donne le détail, un `.sum()`/`.all()`/`.n_unique()` sur cette même expression donne
-> l'agrégat.
+> **Point decimal** : `totalDigits=25` dépasse la précision d'un float64. La colonne est
+> donc lue en **texte** et vérifiée lexicalement — plus juste et compatible streaming.
 
 ---
 
-## 6. Flux d'exécution (du CSV au rapport)
+## 5. La règle
 
-1. **Réception des entrées** : les **trois entrées du moteur, au même niveau** — la
-   référence du CSV (COS), le schéma (XSD ou JSON), et la **liste des règles à
-   appliquer**. La liste des règles est fournie en input (elle n'est ni codée en dur ni
-   récupérée par le moteur lui-même). La façon dont ces entrées arrivent est hors
-   périmètre.
-2. **Parsing du schéma** → schéma normalisé (résolution de types).
-3. **Chargement du catalogue** → liste de `Rule` actives, via le RuleRegistry.
-4. **Ouverture de la source** : `DataSource` fournit un `LazyFrame` Polars en
-   streaming depuis l'URI. Les colonnes decimal à précision sont typées en texte pour
-   validation lexicale.
-5. **Planification** : les règles sont regroupées par scope d'exécution
-   (`FILE` → `COLUMN` → `ROW`) ; dans `COLUMN` et `ROW`, les vérifications sont empilées
-   en un minimum de passes vectorisées.
-6. **Exécution** :
-   - scope `FILE` : contrôles globaux (parse OK, ≥1 ligne, en-tête conforme, existence
-     et type des colonnes). Gate : un échec bloquant structurel arrête ici (toutes les
-     vérifications structurelles sont toutefois exécutées avant de bloquer, pour le
-     panorama complet).
-   - scope `COLUMN` : validation technique déduite du XSD (si `check-types` est dans la
-     liste) et contrôles par colonne, en une passe vectorisée. Collecte, aucun gate.
-   - scope `ROW` : vérifications croisant plusieurs colonnes d'une même ligne. Collecte,
-     aucun gate.
-   - scope `CROSS` (croisement inter-lignes : unicité, doublons, agrégats) : **décrit
-     mais non implémenté en v1**.
-7. **Construction du rapport** : agrégation des résultats, compteurs, échantillons
-   bornés, diagnostic config-vs-données → `ValidationReport`.
-8. **Émission** : le rapport est remis au `ReportSink` (abstrait ici).
+Une règle est une **donnée de configuration** reçue en entrée. Elle référence un type
+d'implémentation et porte ses paramètres ; elle ne contient jamais de logique.
 
----
+### Structure d'une règle de config
 
-## 7. Performance et parallélisme
+```json
+{
+  "rule_id": "R-010",
+  "rule_type": "check-types",
+  "action": "REJECT",
+  "strict": false,
+  "params": {},
+  "exempted_columns": [],
+  "enabled": true
+}
+```
 
-**Le parallélisme vient de Polars, pas de threads Python.** Polars (Rust, hors GIL)
-parallélise nativement l'évaluation des expressions sur tous les cœurs et gère la
-mémoire en streaming. Le rôle du moteur est de **formuler la validation en
-expressions Polars vectorisées** plutôt qu'en boucles Python.
+| Champ | Rôle |
+|-------|------|
+| `rule_id` | identifiant unique |
+| `rule_type` | clé vers le RuleRegistry. **Porte le scope** (FILE/COLUMN/ROW/CROSS) et la nature du verdict — tous deux définis dans le registre, pas dans la config |
+| `action` | `REJECT` (échec ⇒ **fichier invalide**) ou `COLLECT` (on note sans invalider). Agit sur la **validité** |
+| `strict` | `true` ⇒ un échec **arrête l'exécution** (gate) ; `false` ⇒ l'exécution continue. Agit sur l'**état d'exécution**. N'a d'effet bloquant que combiné à `REJECT` |
+| `params` | paramètres du type (seuils, colonnes, opérandes d'une comparaison…) |
+| `exempted_columns` | colonnes exemptées, **règles de scope `COLUMN` uniquement** (optionnel) |
+| `enabled` | règle active ou non |
 
-- `threading` Python : inutile (GIL ; le calcul est déjà hors GIL dans Polars).
-- `multiprocessing` sur un seul fichier : à éviter (duplication mémoire, et casse les
-  règles CROSS qui ont besoin de voir tout le dataset). Le seul usage pertinent du
-  multiprocessing serait de valider **plusieurs fichiers en parallèle** — mais c'est
-  de l'orchestration au-dessus du moteur, hors de son cœur.
+La liste de configuration reçue en entrée **guide l'instanciation** : pour chaque entrée,
+le moteur résout le `rule_type` vers son implémentation et son scope dans le registre,
+puis assemble avec les `params` pour produire une règle exécutable.
 
-**Leviers concrets** :
+### Code (registre) vs donnée (config)
 
-- **Lazy + streaming** (`scan_csv` → `collect(streaming=True)`) : mémoire bornée sur
-  5 Go. C'est le vrai levier mémoire.
-- **Regroupement par scope** : dans `COLUMN` et `ROW`, une passe vectorisée couvre
-  plusieurs règles au lieu d'une relecture par règle.
-- **Décimaux en texte** : validation lexicale de la précision, sans conversion float
-  (justesse + compatibilité streaming).
-- **Scope `CROSS` hors v1** : les règles inter-lignes (unicité/doublons/agrégats,
-  scope `CROSS` + nature `CROSS_AGGREGATE`) — les seules qui casseraient le streaming et
-  poseraient un risque mémoire — ne sont pas fournies en v1. La v1 reste donc
-  entièrement streamable ; le scope reste décrit comme point de couture pour un ajout
-  ultérieur.
-- **Rapport borné** : compteurs exacts + échantillons, pas de liste exhaustive.
+- **RuleRegistry (code)** — pour chaque `rule_type` : son implémentation Polars et son
+  scope. Ne varie pas d'un fichier à l'autre. C'est la bibliothèque des types
+  *disponibles*.
+- **Liste de règles (donnée)** — quelles règles on applique, avec quels paramètres. Lue
+  en amont (ex. depuis une table) par le composant appelant et passée **en entrée** ; le
+  moteur ne se connecte à aucune base.
+
+Ajouter une règle qui réutilise un `rule_type` existant = une ligne de config, aucun
+code. Une logique inédite = un nouveau type dans le registre. Le moteur ne change jamais.
 
 ---
 
-## 8. Multi-format : préparer la validation XML (v2)
+## 6. Ordre d'exécution et gate
 
-Objectif : le moteur validera d'abord du CSV, puis devra aussi valider du XML dans un
-second temps. On ne conçoit pas l'implémentation XML maintenant (sa forme exacte est
-encore inconnue), mais on identifie les **points de couture** pour que l'ajout du XML
-n'oblige pas à refondre le moteur.
+Les règles s'exécutent par **scope**, du plus grossier au plus fin :
 
-**Le CSV est tabulaire et plat** (lignes × colonnes). **Le XML est hiérarchique et
-imbriqué** (éléments, attributs, répétitions, profondeur arbitraire). Cette différence
-touche trois couches — et trois seulement.
+1. **`FILE`** — contrôles globaux avant de toucher les données : lisibilité, non-vide,
+   en-tête conforme, existence et type des colonnes.
+2. **`COLUMN`** — vérifications colonne par colonne, dont la validation technique du XSD
+   (via `check-types`).
+3. **`ROW`** — relations entre colonnes d'une même ligne (ex. `MatDt >= IssDt`).
+4. **`CROSS`** — croisement entre lignes (unicité, doublons, agrégats). **Décrit, non
+   implémenté en v1** : seul scope qui casserait le streaming pur (risque mémoire). Reste
+   un point d'extension.
 
-### 8.1 Ce qui diverge par format (à abstraire)
+**Le gate est piloté par le mode `strict`, à n'importe quel scope.** À la fin de chaque
+scope, toutes ses règles ayant été évaluées (on ne coupe pas règle par règle, pour livrer
+le panorama complet), le gate examine le lot : s'il existe une règle en échec qui est à
+la fois `REJECT` **et** `strict`, l'exécution s'arrête et les scopes suivants ne sont pas
+exécutés. Sinon, on continue — même si des règles `REJECT` non-`strict` ont échoué (le
+fichier est alors marqué invalide, mais on poursuit la collecte pour tout diagnostiquer).
 
-- **Ingestion (DataSource)** : le CSV produit un `LazyFrame` Polars tabulaire. Le XML
-  produira une autre représentation (voir 8.2). L'interface DataSource doit donc être
-  généralisée : « fournir les données sous une forme exploitable par les règles »,
-  sans présupposer que c'est un tableau.
-- **Représentation en mémoire** : tabulaire (Polars) pour le CSV ; pour le XML, deux
-  cas possibles selon la structure réelle — soit un **aplatissement** en tabulaire
-  quand la structure est régulière (liste de records répétés → table, on garde Polars
-  et le streaming), soit un **modèle arborescent** streamé (type iterparse/SAX) si la
-  structure est vraiment imbriquée. Le choix sera fait quand le XML sera connu.
-- **Implémentations de règles structurelles** : la règle « Schema Structure » ou
-  « Field Format » n'a pas la même implémentation sur un tableau plat et sur un arbre.
-  Le RuleRegistry doit pouvoir associer un même *type de règle* à des implémentations
-  **différentes selon le format**.
-- **Scopes** : les scopes d'exécution actuels (`FILE`, `COLUMN`, `ROW`) et les natures
-  de règle tabulaires (`PER_CELL`, `CROSS_COLUMN`, `COLUMN_AGGREGATE`, `CROSS_AGGREGATE`)
-  sont pensés pour du tabulaire. Le XML ajoutera des scopes/natures arborescents
-  (NODE/ELEMENT, ATTRIBUTE, chemin, cardinalité d'un élément répété…). Le modèle doit
-  rester ouvert (énumération extensible).
+En pratique, les contrôles structurels du scope `FILE` (lisibilité, en-tête, colonnes)
+sont typiquement `strict` : inutile de valider des valeurs si le fichier est corrompu ou
+mal structuré. Les règles de valeurs (`COLUMN`, `ROW`) sont typiquement non-`strict` :
+on veut collecter toutes leurs erreurs. Mais rien n'est codé en dur — c'est la config qui
+décide, règle par règle.
 
-### 8.2 Ce qui reste commun (mutualisé, inchangé)
+Ordre effectif : `FILE` → `COLUMN` → `ROW` → `CROSS` (v2), l'exécution s'arrêtant au
+premier scope où une règle `REJECT` + `strict` échoue.
 
-Tout le cœur du moteur est indépendant du format et ne bouge pas :
-
-- le **catalogue de règles** (données) et son chargement,
-- le modèle d'**ordre par scope + gate structurel**,
-- la **sévérité** (BLOCKING / COLLECTING),
-- les **exemptions** de colonnes/éléments (statuts ERROR / WAIVED),
-- le **rapport** structuré et borné,
-- le **RuleRegistry** en tant que mécanisme (seules les implémentations enregistrées
-  varient).
-
-### 8.3 Note sur le schéma
-
-Le **XSD est déjà le schéma naturel du XML** : aucune conversion de schéma à prévoir
-pour le cas XML (c'est son usage d'origine). Le schéma normalisé (section 4.1) reste le
-point de convergence : XSD et JSON l'alimentent déjà ; pour le XML, il faudra
-simplement enrichir le schéma normalisé avec la dimension hiérarchique (relations
-parent/enfant, cardinalités) que le format tabulaire n'utilise pas.
-
-### 8.4 Abstraction cible
-
-Introduire une notion de **DataFormat** (CSV / XML) qui regroupe, par format : sa
-DataSource, sa représentation mémoire, et son jeu d'implémentations de règles
-structurelles. Le moteur sélectionne le DataFormat selon l'entrée, puis exécute la
-même mécanique (catalogue, ordre par scope, gate, rapport) par-dessus. **Rien de tout
-cela n'est codé en v1** — on s'assure seulement que ces interfaces existent pour que la
-v2 XML soit un ajout, pas une réécriture.
+**Planner puis Runner.** L'`ExecutionPlanner` décide (ordonne par scope, empile les
+passes, active `check-types` en récupérant les validateurs du XSD) sans toucher aux
+données. Le `Runner` agit : il déroule le plan sur le LazyFrame, résout les
+implémentations via le registre, évalue plusieurs règles d'un même scope en **une passe
+vectorisée** (levier de perf sur 5 Go), applique le gate (arrêt si une règle `REJECT` +
+`strict` échoue), collecte les
+résultats.
 
 ---
 
-## 9. Points d'extension (récapitulatif)
+## 7. Le rapport
 
-| Besoin | Où l'on agit | Impact sur le moteur |
-|--------|--------------|----------------------|
-| Nouveau format de schéma (ex. YAML) | nouveau SchemaParser | aucun |
-| Nouveau backend de stockage | nouvelle DataSource | aucun |
-| Nouvelle destination de rapport | nouveau ReportSink | aucun |
-| Nouvelle règle (logique existante) | ligne dans la table de config (base) | aucun |
-| Nouvelle règle (logique inédite) | nouveau type dans le RuleRegistry (code) | aucun |
-| Nouvelle nature de règle (arborescente…) | valeur de `check_nature` + implémentation | aucun sur l'exécution |
-| Activer/désactiver une règle | champ `enabled` du catalogue | aucun |
-| Exempter des colonnes d'une règle | champ `exempted_columns` du catalogue | aucun |
-| Nouveau format de données (XML) | nouveau DataFormat (DataSource + règles structurelles) | cœur inchangé (cf. §8) |
+Le `ValidationReport` (objet en mémoire) contient :
+
+- `status` : `VALID` / `INVALID` ; `stopped_at` (le scope où une règle `REJECT` +
+  `strict` a arrêté l'exécution) si applicable.
+- `summary` : compteurs globaux (erreurs, par action, lignes contrôlées / en erreur).
+- `results` : un résultat par règle — `rule_id`, `rule_type`, `scope`, `action`,
+  `passed`, `error_count`, `waived_count`, `failure_rate`, un **échantillon borné**
+  (N=100 par défaut) des lignes fautives, et un `diagnostic_hint`.
+- `diagnostic` : synthèse globale config-vs-données.
+
+**Exemptions de colonnes.** Une colonne exemptée (`exempted_columns`, scope `COLUMN`) est
+**quand même testée**, mais ses erreurs sont classées `WAIVED` (tracées, non bloquantes)
+au lieu de `ERROR`. Le `passed` et le gate se calculent sur les `ERROR` seulement.
+
+**Diagnostic config-vs-données.** Le moteur *suggère* si un échec vient plutôt de la
+configuration ou des données, sans l'affirmer. Signaux, du plus au moins probant :
+
+| Signature | Interprétation |
+|-----------|----------------|
+| en-tête non conforme | presque certainement la config (mauvais schéma) |
+| toutes les colonnes en échec | très probablement la config |
+| 100 % d'une colonne en échec | probablement la config (ex. mauvais format attendu) |
+| échecs partiels et épars | probablement de vraies erreurs de données |
+
+Exposé par règle (`diagnostic_hint` : `LIKELY_CONFIG` / `LIKELY_DATA` / `INCONCLUSIVE`)
+et en synthèse globale.
+
+---
+
+## 8. Performance
+
+- **Parallélisme Polars natif** (Rust, hors GIL) — pas de threading/multiprocessing
+  Python, qui dupliquerait la mémoire et casserait les règles inter-lignes.
+- **Une passe par scope** — plusieurs règles d'un même scope évaluées ensemble, plutôt
+  qu'une relecture des 5 Go par règle.
+- **Décimaux en texte** — validation lexicale, pas de conversion float qui perdrait en
+  précision.
+- **Rapport borné** — compteurs exacts + échantillons, pas de liste exhaustive en
+  mémoire.
+
+---
+
+## 9. Extensibilité et multi-format (v2)
+
+Le cœur du moteur est indépendant du format de données. Le passage à un second format
+(XML) réutilise tel quel : le catalogue de règles, l'ordre par scope + gate, l'action,
+les exemptions, le rapport, le RuleRegistry. Ne changent que les points de couture : la
+`DataSource` (fournir les données sous une forme consommable, pas forcément tabulaire),
+la représentation mémoire (aplatir en tabulaire si la structure est régulière, sinon
+arbre streamé), les implémentations de règles structurelles selon le format, et de
+nouveaux scopes arborescents si besoin. Le XSD est le schéma naturel du XML — pas de
+conversion.
+
+Récapitulatif des points d'extension :
+
+| Besoin | Action | Impact moteur |
+|--------|--------|---------------|
+| Nouvelle règle (logique existante) | une ligne dans la config | aucun |
+| Nouvelle règle (logique inédite) | nouveau `rule_type` dans le registre | aucun |
+| Activer/désactiver une règle | champ `enabled` | aucun |
+| Exempter des colonnes | champ `exempted_columns` (scope COLUMN) | aucun |
+| Nouveau format de schéma | nouveau SchemaParser | aucun |
+| Nouveau stockage | nouvelle DataSource | aucun |
+| Nouveau format de données (XML) | nouveau DataFormat | cœur inchangé |

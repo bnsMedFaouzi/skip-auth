@@ -1,21 +1,21 @@
 # jwt_decoder
 
-## Objectif
-Module utilitaire pour décoder et valider des JWT (JSON Web Tokens) utilisés par les clients TAASe. Isole la logique de parsing/vérification du token du reste du code client.
+## Purpose
+Utility module for decoding and validating JWTs (JSON Web Tokens) used by TAASe clients. Isolates token parsing/verification logic from the rest of the client code.
 
 ## Structure
-| Fichier         | Rôle                                                      |
+| File            | Role                                                      |
 |-----------------|-------------------------------------------------------------|
-| `__init__.py`   | Point d'entrée du package, expose les classes/fonctions publiques |
-| `jwt.py`        | Logique principale : décodage, vérification de signature, extraction des claims |
-| `settings.py`   | Configuration (clé publique, algorithme, audience, issuer...) |
-| `token.py`      | Modèle/objet représentant un token décodé et ses accesseurs |
+| `__init__.py`   | Package entry point, exposes public classes/functions |
+| `jwt.py`        | Core logic: decoding, signature verification, claims extraction |
+| `settings.py`   | Configuration (public key, algorithm, audience, issuer...) |
+| `token.py`      | Model/object representing a decoded token and its accessors |
 
-## Dépendances
-- `PyJWT` (ou équivalent) pour le décodage/vérification
-- `pydantic` / `pydantic-settings` pour la configuration et la validation des claims
+## Dependencies
+- `PyJWT` (or equivalent) for decoding/verification
+- `pydantic` / `pydantic-settings` for configuration and claims validation
 
-## Utilisation type
+## Typical usage
 ```python
 from jwt_decoder.token import decode_token
 
@@ -23,4 +23,4 @@ claims = decode_token(raw_jwt)
 ```
 
 ## Notes
-- Vérifier que les paramètres de vérification (algo, clé, audience) dans `settings.py` correspondent à l'émetteur du token (TAASe / IDP).
+- Make sure the verification parameters (algorithm, key, audience) in `settings.py` match the token issuer (TAASe / IdP).

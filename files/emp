@@ -1,25 +1,25 @@
 # taase_token
 
-## Objectif
-Gère l'authentification auprès du service TAASe : récupération, cache et rafraîchissement des tokens OAuth2, avec support de HashiCorp Vault pour la gestion des secrets.
+## Purpose
+Handles authentication with the TAASe service: retrieval, caching, and refreshing of OAuth2 tokens, with HashiCorp Vault support for secrets management.
 
 ## Structure
-| Fichier                     | Rôle                                                          |
+| File                         | Role                                                          |
 |------------------------------|----------------------------------------------------------------|
-| `__init__.py`                | Point d'entrée du package                                       |
-| `client.py`                  | Client HTTP pour dialoguer avec l'endpoint OAuth2 de TAASe       |
-| `errors.py`                  | Exceptions personnalisées (erreurs d'auth, de token, réseau...) |
-| `hvault.py`                  | Intégration HashiCorp Vault pour récupérer/stocker les secrets  |
-| `schemas.py`                 | Modèles Pydantic (requêtes/réponses de l'API token)             |
-| `settings.py`                | Configuration (URL, client ID, secret, mount point Vault...)    |
-| `taase_token_manager.py`     | Orchestration : récupère un token, gère cache/expiration/refresh |
+| `__init__.py`                | Package entry point                                             |
+| `client.py`                  | HTTP client for communicating with the TAASe OAuth2 endpoint     |
+| `errors.py`                  | Custom exceptions (auth errors, token errors, network errors...) |
+| `hvault.py`                  | HashiCorp Vault integration for fetching/storing secrets         |
+| `schemas.py`                 | Pydantic models (token API requests/responses)                   |
+| `settings.py`                | Configuration (URL, client ID, secret, Vault mount point...)      |
+| `taase_token_manager.py`     | Orchestration: fetches a token, manages caching/expiry/refresh    |
 
-## Dépendances
-- `pydantic` / `pydantic-settings` pour la configuration et les schémas
-- `httpx` ou `requests` pour les appels HTTP
-- `hvac` (client Python Vault) pour `hvault.py`
+## Dependencies
+- `pydantic` / `pydantic-settings` for configuration and schemas
+- `httpx` or `requests` for HTTP calls
+- `hvac` (Vault Python client) for `hvault.py`
 
-## Utilisation type
+## Typical usage
 ```python
 from taase_token.taase_token_manager import TaaseTokenManager
 
@@ -28,5 +28,5 @@ token = manager.get_token()
 ```
 
 ## Notes
-- Les secrets (client secret, certs) sont récupérés via Vault (`hvault.py`) plutôt que codés en dur.
-- `errors.py` centralise les exceptions pour un traitement homogène des erreurs d'auth côté appelant.
+- Secrets (client secret, certs) are retrieved via Vault (`hvault.py`) rather than hardcoded.
+- `errors.py` centralizes exceptions for consistent error handling on the caller side.

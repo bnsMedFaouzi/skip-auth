@@ -1,278 +1,32 @@
-# Exemple de bout en bout — CSV + XSD + règles → rapport
+# taase_token
 
-Cas concret illustrant le moteur sur un extrait du schéma d'instruments. On part d'un
-XSD (extrait), d'une liste de règles (config), d'un fichier CSV contenant quelques
-erreurs volontaires, et on montre le rapport produit.
+## Objectif
+Gère l'authentification auprès du service TAASe : récupération, cache et rafraîchissement des tokens OAuth2, avec support de HashiCorp Vault pour la gestion des secrets.
 
----
+## Structure
+| Fichier                     | Rôle                                                          |
+|------------------------------|----------------------------------------------------------------|
+| `__init__.py`                | Point d'entrée du package                                       |
+| `client.py`                  | Client HTTP pour dialoguer avec l'endpoint OAuth2 de TAASe       |
+| `errors.py`                  | Exceptions personnalisées (erreurs d'auth, de token, réseau...) |
+| `hvault.py`                  | Intégration HashiCorp Vault pour récupérer/stocker les secrets  |
+| `schemas.py`                 | Modèles Pydantic (requêtes/réponses de l'API token)             |
+| `settings.py`                | Configuration (URL, client ID, secret, mount point Vault...)    |
+| `taase_token_manager.py`     | Orchestration : récupère un token, gère cache/expiration/refresh |
 
-## 1. Le schéma (extrait de XSD)
+## Dépendances
+- `pydantic` / `pydantic-settings` pour la configuration et les schémas
+- `httpx` ou `requests` pour les appels HTTP
+- `hvac` (client Python Vault) pour `hvault.py`
 
-On ne garde que 5 colonnes pour l'exemple :
+## Utilisation type
+```python
+from taase_token.taase_token_manager import TaaseTokenManager
 
-```xml
-<xs:element name="InstrmtName" nillable="false">
-  <xs:simpleType><xs:restriction base="xs:string">
-    <xs:maxLength value="150"/>
-  </xs:restriction></xs:simpleType>
-</xs:element>
-
-<xs:element name="InstrmtCcy" type="Currency" nillable="false"/>
-
-<xs:element name="IssDt" type="xs:date" nillable="true"/>
-<xs:element name="MatDt" type="xs:date" nillable="true"/>
-
-<xs:element name="FloatingRtFlag" type="YesNo" nillable="true"/>
+manager = TaaseTokenManager()
+token = manager.get_token()
 ```
 
-Types nommés (déclarés plus haut dans le XSD) :
-
-```xml
-<xs:simpleType name="YesNo">
-  <xs:restriction base="xs:string">
-    <xs:enumeration value="Y"/><xs:enumeration value="N"/>
-  </xs:restriction>
-</xs:simpleType>
-
-<xs:simpleType name="Currency">
-  <xs:restriction base="xs:string"><xs:maxLength value="3"/></xs:restriction>
-</xs:simpleType>
-```
-
-**Ce que le parseur en déduit** (schéma normalisé) :
-
-| order | Colonne | base_type | nullable | contraintes |
-|-------|---------|-----------|----------|-------------|
-| 0 | InstrmtName | string | non | max_length = 150 |
-| 1 | InstrmtCcy | string | non | max_length = 3 |
-| 2 | IssDt | date | oui | format date |
-| 3 | MatDt | date | oui | format date |
-| 4 | FloatingRtFlag | string (enum) | oui | allowed_values = {Y, N} |
-
-Le champ `order` fixe la **position attendue** de chaque colonne. Le contrôle
-`SchemaStructure` (scope FILE) l'utilise pour vérifier non seulement que les colonnes
-sont **présentes**, mais aussi qu'elles sont dans le **bon ordre** (`ordered: true`).
-
----
-
-## 2. La liste des règles (config reçue en entrée)
-
-Le moteur reçoit cette liste (lue en amont depuis la table de config, pas par le moteur
-lui-même). La config porte le `rule_type`, l'`action`, le mode `strict` et les
-`params` ; le **scope est déduit du registre** à l'instanciation (il n'est pas dans la
-config). Deux règles activent la validation déduite du XSD : `check-types` (type,
-longueur, énumération, format) et `MandatoryFields` (obligatoire).
-
-| rule_id | rule_type | action | strict | params | scope (déduit du registre) |
-|---------|-----------|--------|--------|--------|----------------------------|
-| R-000 | Readability | REJECT | true | — | FILE |
-| R-001 | EmptyFile | REJECT | true | min 1 row | FILE |
-| R-002 | SchemaStructure | REJECT | true | 5 colonnes attendues, dans l'ordre | FILE |
-| R-010 | check-types | REJECT | false | (type/longueur/enum/format, du XSD) | COLUMN |
-| R-020 | MandatoryFields | REJECT | false | (colonnes nillable=false, du XSD) | COLUMN |
-| R-030 | DateOrder | COLLECT | false | MatDt >= IssDt | ROW |
-
-Les contrôles structurels (`FILE`) sont `strict` : si le fichier est illisible, vide ou
-mal structuré, on arrête tout de suite. `check-types` et `MandatoryFields` sont ici
-`REJECT` **non-`strict`** : un échec rend le fichier invalide, mais on continue pour tout
-collecter (on pourrait mettre `MandatoryFields` en `strict` pour arrêter dès qu'un champ
-obligatoire est vide). `DateOrder` est `COLLECT` : on note sans invalider.
-
-`check-types` et `MandatoryFields` étant présentes, le parseur charge la validation
-déduite du XSD : via `check-types`, format date sur `IssDt`/`MatDt`, longueur sur
-`InstrmtName`/`InstrmtCcy`, énumération sur `FloatingRtFlag` ; via `MandatoryFields`,
-l'**obligatoire** (`nillable=false`) sur `InstrmtName`/`InstrmtCcy`. Aucune de ces règles
-ne redéfinit le XSD : elles l'activent. Seul `DateOrder` (cohérence métier
-inter-colonnes) est déclaré explicitement, car il ne se déduit pas du XSD.
-
-### 2.1 Exemples de règles détaillées (lignes de config)
-
-Point clé : **la validation déduite du XSD (type, longueur, énumération, format,
-obligatoire) vient du XSD**, pas de la config. On ne redéfinit jamais un
-type/format/longueur/obligatoire dans la table — le XSD contient déjà cette information,
-et les règles `check-types` (type/longueur/enum/format) et `MandatoryFields` (obligatoire)
-disent simplement « exploite-la ». La table de config ne contient donc que : les règles
-de **structure/fichier**, l'**activation** des validations XSD (`check-types`,
-`MandatoryFields`), les règles **métier** qui ne se déduisent pas du XSD, et des
-**surcharges** (activer/désactiver, exempter des colonnes).
-
-Chaque règle vue champ par champ telle qu'elle serait stockée en table (présentée ici
-en JSON pour la lisibilité) :
-
-Une règle de **structure** (`SchemaStructure`, scope FILE déduit du registre). Avec
-`ordered: true`, elle vérifie que les colonnes sont **présentes ET dans le bon ordre**
-(positions issues du champ `order` du schéma) ; l'ordre attendu est celui de
-`expected_columns`. Un fichier dont l'en-tête serait `InstrmtCcy,InstrmtName,…`
-(colonnes présentes mais permutées) échouerait ici :
-
-```json
-{
-  "rule_id": "R-002",
-  "rule_type": "SchemaStructure",
-  "action": "REJECT",
-  "strict": true,
-  "params": { "expected_columns": ["InstrmtName","InstrmtCcy","IssDt","MatDt","FloatingRtFlag"], "ordered": true },
-  "enabled": true
-}
-```
-
-La règle **check-types** — elle **active** le contrôle de type, longueur, énumération et
-format déduit du XSD (l'obligatoire relève désormais de `MandatoryFields`). Elle ne porte
-aucun paramètre de type : tout vient du XSD. Dans l'exemple courant elle n'exempte rien
-(elle valide toutes les colonnes). Le champ optionnel `exempted_columns` permettrait
-d'exclure certaines colonnes — testées quand même, mais erreurs neutralisées / tracées.
-Illustration (variante, non utilisée dans le rapport ci-dessous) :
-
-```json
-{
-  "rule_id": "R-010",
-  "rule_type": "check-types",
-  "action": "REJECT",
-  "strict": false,
-  "params": {},
-  "exempted_columns": ["FloatingRtFlag"],
-  "enabled": true
-}
-```
-
-> Ici `FloatingRtFlag` est exemptée : sa validation d'énumération (déduite du XSD) est
-> quand même exécutée, mais ses erreurs sont classées `WAIVED` — tracées, non bloquantes.
-> Sans `exempted_columns`, `check-types` valide **toutes** les colonnes du XSD.
-
-La règle **MandatoryFields** — elle **active** le contrôle d'obligatoire sur les colonnes
-`nillable="false"` du XSD (ici `InstrmtName` et `InstrmtCcy`). Comme `check-types`, elle
-est alimentée par le XSD et ne cible aucune colonne à la main. Ici non-`strict` (on
-collecte) ; on pourrait la mettre en `strict` pour arrêter dès qu'un champ obligatoire est
-vide :
-
-```json
-{
-  "rule_id": "R-020",
-  "rule_type": "MandatoryFields",
-  "action": "REJECT",
-  "strict": false,
-  "params": {},
-  "enabled": true
-}
-```
-
-Une règle **métier inter-colonnes** (`DateOrder`, scope ROW déduit du registre) — ce
-type de règle ne se déduit PAS du XSD : « MatDt >= IssDt » est une cohérence
-fonctionnelle, elle doit donc être déclarée en config :
-
-```json
-{
-  "rule_id": "R-030",
-  "rule_type": "DateOrder",
-  "action": "COLLECT",
-  "strict": false,
-  "params": { "left": "MatDt", "op": ">=", "right": "IssDt" },
-  "enabled": true
-}
-```
-
-En résumé : la validation **technique** (R-010 `check-types`, alimentée par le XSD) et
-les règles **métier** (R-030, déclarées en config) coexistent dans la même liste. Les
-règles métier réutilisent des `rule_type` implémentés dans le registre (code) ; les
-ajouter/modifier ne demande aucune modification du moteur, seulement de la config.
-
----
-
-## 3. Le fichier CSV (avec erreurs volontaires)
-
-```csv
-InstrmtName,InstrmtCcy,IssDt,MatDt,FloatingRtFlag
-Bond Alpha,EUR,2024-01-15,2029-01-15,N
-Bond Beta,USD,2023-06-01,2028-06-01,Y
-Note Gamma,EURO,2024-03-10,2030-03-10,N
-Bond Delta,GBP,15/04/2024,2031-04-01,Y
-,USD,2024-05-01,2020-05-01,X
-Bond Zeta,JPY,2024-07-01,2034-07-01,N
-```
-
-Les erreurs glissées (lignes numérotées à partir de 1 = première ligne de données) :
-
-- Ligne 3 : `InstrmtCcy = EURO` → 4 caractères, dépasse max_length = 3.
-- Ligne 4 : `IssDt = 15/04/2024` → mauvais format (attendu `YYYY-MM-DD`).
-- Ligne 5 : `InstrmtName` vide → viole nillable=false (obligatoire).
-- Ligne 5 : `FloatingRtFlag = X` → hors énumération {Y, N}.
-- Ligne 5 : `MatDt (2020) < IssDt (2024)` → viole MatDt >= IssDt.
-
----
-
-## 4. L'exécution (par scope)
-
-**Scope FILE** — le fichier s'ouvre (R-000 OK), il a des lignes (R-001 OK), les 5
-colonnes attendues sont présentes, bien nommées **et dans le bon ordre** (R-002 OK,
-`ordered: true`). Les règles `FILE` sont `strict`, mais aucune n'échoue : le gate ne
-bloque pas, on entre dans les scopes suivants.
-
-**Scope COLUMN** — en une passe vectorisée, les deux règles COLUMN s'exécutent :
-- `check-types` détecte : `EURO` ligne 3 (longueur > max 3), `15/04/2024` ligne 4 (format
-  date), `X` ligne 5 (hors énumération).
-- `MandatoryFields` détecte : `InstrmtName` vide ligne 5 (obligatoire, `nillable=false`).
-
-**Scope ROW** :
-- `DateOrder` : détecte `MatDt < IssDt` en ligne 5.
-
-> Note : `check-types` et `MandatoryFields` sont `REJECT` mais **non-`strict`** — leurs
-> échecs rendent le fichier INVALID, mais comme aucune n'est `strict`, le gate ne bloque
-> pas : on continue vers ROW et on collecte tout pour le diagnostic. Si `MandatoryFields`
-> était `strict`, l'exécution s'arrêterait à la fin du scope COLUMN et `DateOrder` ne
-> serait pas évaluée.
-
----
-
-## 5. Le rapport produit (ValidationReport)
-
-```
-status        : INVALID
-file_ref      : instruments_2024.csv
-schema_ref    : Instruments_Characteristics_CSV (extrait)
-stopped_at    : —   (aucune règle REJECT + strict en échec)
-
-summary
-  rows_checked   : 6
-  rows_in_error  : 3          (lignes 3, 4, 5)
-  error_count    : 5
-  by_action      : REJECT 4 · COLLECT 1
-
-results
-  R-002 SchemaStructure  (FILE, REJECT)     passed ✓
-  R-010 check-types      (COLUMN, REJECT)   passed ✗  error_count 3
-      • InstrmtCcy  ligne 3  "EURO"        longueur 4 > max 3
-      • IssDt       ligne 4  "15/04/2024"  format attendu YYYY-MM-DD
-      • FloatingRtFlag ligne 5 "X"         hors {Y, N}
-      failure_rate 0.10 · diagnostic_hint LIKELY_DATA
-  R-020 MandatoryFields  (COLUMN, REJECT)   passed ✗  error_count 1
-      • InstrmtName ligne 5  (vide)        obligatoire (nillable=false)
-      failure_rate 0.03 · diagnostic_hint LIKELY_DATA
-  R-030 DateOrder        (ROW, COLLECT)     passed ✗  error_count 1
-      • ligne 5  MatDt 2020-05-01 < IssDt 2024-05-01
-      failure_rate 0.03 · diagnostic_hint LIKELY_DATA
-
-diagnostic (global)
-  Échecs partiels et épars (3–10 %) répartis sur plusieurs colonnes/règles.
-  → ressemble à de vraies erreurs de données (pas un problème de config).
-```
-
----
-
-## 6. Variante — un problème de configuration
-
-Même fichier, mais on applique par erreur un schéma qui attend `IssDt` au format
-`DD/MM/YYYY`. Résultat : **toutes** les lignes de `IssDt` échouent au format.
-
-```
-results
-  R-010 check-types  (COLUMN)  passed ✗  error_count 6
-      failure_rate 1.00 · diagnostic_hint LIKELY_CONFIG
-
-diagnostic (global)
-  100 % de la colonne IssDt en échec de format.
-  → suspicion de configuration : mauvais format de date attendu ?
-     Vérifier le schéma avant de traiter le fichier comme invalide.
-```
-
-C'est le mécanisme config-vs-données : un échec à 100 % sur une colonne oriente vers un
-problème de config, pas vers un fichier réellement mauvais.
+## Notes
+- Les secrets (client secret, certs) sont récupérés via Vault (`hvault.py`) plutôt que codés en dur.
+- `errors.py` centralise les exceptions pour un traitement homogène des erreurs d'auth côté appelant.

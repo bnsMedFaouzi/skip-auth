@@ -16,16 +16,13 @@ every measurement reports its own peak rather than the running maximum.
 
 What it reports
 ---------------
-1. Headline   -> time, throughput, peak memory, rows, errors
-2. Batch size -> row_batch_size is a memory knob, not a speed knob
-3. Engine     -> streaming vs in-memory
+time, throughput, peak memory, rows, errors — for one run with default config.
 
 Notes
 -----
-- suite(..., quick=True) runs the headline only (handy on very large files).
 - Set EngineConfig.default_date_format to match your Date columns.
 - Throughput is per available core; check the printed core count.
-- Peak reset relies on /proc (Linux); on macOS peaks across cases stay monotone.
+- Peak reset relies on /proc (Linux); on macOS the peak stays a process maximum.
 """
 
 from __future__ import annotations
@@ -39,7 +36,6 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent                       # dir containing the `csv_validator` package
-BATCHES = (20_000, 50_000, 100_000, 200_000)
 
 
 # --------------------------------------------------------------------------- #
@@ -80,21 +76,15 @@ def _peak_rss_mb() -> float:
     return rss / 1024                     # kilobytes -> MB
 
 
-def measure(schema: str, csv: str, streaming: bool, batch: int) -> dict:
-    """Run one validation in-process and return its timing/memory/result metrics.
-
-    Everything except the axis under test (streaming / batch) uses EngineConfig
-    defaults — notably the date format (set it in EngineConfig if yours differs).
-    """
+def measure(schema: str, csv: str) -> dict:
+    """Run one validation in-process (default EngineConfig) and return its metrics."""
     warnings.filterwarnings("ignore")
     sys.path.insert(0, str(ROOT))
     import csv_validator as cv
 
-    row_batch_size = None if batch <= 0 else batch   # <=0 -> auto-size from column count
-    cfg = cv.EngineConfig(streaming=streaming, row_batch_size=row_batch_size)
     _reset_peak_rss()
     start = time.perf_counter()
-    report = cv.validate(schema, csv, config=cfg)
+    report = cv.validate(schema, csv)
     elapsed = time.perf_counter() - start
     return {
         "time": elapsed, "peak_mb": _peak_rss_mb(),
@@ -103,16 +93,16 @@ def measure(schema: str, csv: str, streaming: bool, batch: int) -> dict:
     }
 
 
-def run_case(schema: Path, csv: Path, *, streaming: bool, batch: int) -> dict:
+def run_case(schema: Path, csv: Path) -> dict:
     """Run one measurement in-process and return its result."""
-    return measure(str(schema), str(csv), streaming, batch)
+    return measure(str(schema), str(csv))
 
 
 # --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
 
-def suite(schema: Path, csv: Path, quick: bool = False) -> None:
+def suite(schema: Path, csv: Path) -> None:
     if not schema.exists():
         sys.exit(f"schema not found: {schema}")
     if not csv.exists():
@@ -123,31 +113,12 @@ def suite(schema: Path, csv: Path, quick: bool = False) -> None:
     print(f"file: {csv.name}  ({size_mb:.0f} MB)   schema: {schema.name}   cores: {ncpu}")
     print()
 
-    # 1) headline (streaming, auto batch = the real default)
-    print("== 1. headline (streaming, auto batch) ==")
-    r = run_case(schema, csv, streaming=True, batch=0)
+    r = run_case(schema, csv)
     print(f"  status   : {r['status']}")
     print(f"  rows     : {r['rows']:,}")
     print(f"  errors   : {r['errors']:,}")
-    print(f"  time     : {r['time']:.1f} s   ({size_mb / r['time']:.1f} MB/s on {ncpu} core(s))")
+    print(f"  time     : {r['time'] * 1000:.1f} ms   ({size_mb / r['time']:.1f} MB/s on {ncpu} core(s))")
     print(f"  peak mem : {r['peak_mb']:.0f} MB")
-
-    if quick:
-        return
-
-    # 2) batch-size sweep -> memory knob, not speed knob
-    print("\n== 2. batch size (memory vs speed) ==")
-    print(f"{'batch':>8} | {'time s':>7} | {'peak MB':>8}")
-    for batch in BATCHES:
-        r = run_case(schema, csv, streaming=True, batch=batch)
-        print(f"{batch:>8} | {r['time']:7.1f} | {r['peak_mb']:8.0f}")
-
-    # 3) streaming vs in-memory
-    print("\n== 3. engine ==")
-    print(f"{'engine':>10} | {'time s':>7} | {'peak MB':>8}")
-    for streaming in (True, False):
-        r = run_case(schema, csv, streaming=streaming, batch=0)
-        print(f"{'streaming' if streaming else 'in-memory':>10} | {r['time']:7.1f} | {r['peak_mb']:8.0f}")
 
 
 def main() -> None:

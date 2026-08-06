@@ -97,8 +97,8 @@ def measure(schema: str, csv: str, streaming: bool, batch: int) -> dict:
     elapsed = time.perf_counter() - start
     return {
         "time": elapsed, "peak_mb": _peak_rss_mb(),
-        "rows": report.file.rows, "errors": report.file.total_errors,
-        "status": report.status,
+        "rows": report.file.rows, "cols": report.file.columns_present,
+        "errors": report.file.total_errors, "status": report.status,
     }
 
 
@@ -130,6 +130,9 @@ def suite(schema: Path, csv: Path, quick: bool = False) -> None:
     print(f"  errors   : {r['errors']:,}")
     print(f"  time     : {r['time'] * 1000:.1f} ms   ({size_mb / r['time']:.1f} MB/s on {ncpu} core(s))")
     print(f"  peak mem : {r['peak_mb']:.0f} MB")
+    import csv_validator as cv
+    est = cv.EngineConfig().estimated_peak_mb(r["cols"])
+    print(f"  model est: {est:.0f} MB   (auto batch, {r['cols']} cols — recalibrate if far)")
 
     if quick:
         return

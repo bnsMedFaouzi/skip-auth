@@ -20,6 +20,12 @@ Mapping (documented, so you can eyeball it):
   base xs:boolean                   -> "boolean"
   type="Foo" (no xs: builtin)       -> "Foo"      (a definitions key)
 
+A named simpleType may restrict *another* named simpleType (its <xs:restriction>
+base is a type name, not an xs: builtin). The consumer's parser only flattens one
+level, so such chains are resolved here at conversion time: every emitted
+definition is flattened down to a primitive type, inheriting the parent's facets,
+with the child's own facets winning.
+
   xs:maxLength    -> Size
   xs:totalDigits  -> TotalDigit
   xs:fractionDigits -> FractionDigit
@@ -60,8 +66,12 @@ def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1].rsplit(":", 1)[-1]
 
 
-def _facets(restriction: ET.Element) -> dict:
-    """Read an <xs:restriction> into the source keys the parser understands."""
+def _facets(restriction: ET.Element, enum_key: str = "AuthorizeValue") -> dict:
+    """Read an <xs:restriction> into the source keys the parser understands.
+
+    `enum_key` selects the key used for enumerations: definitions emit "enum",
+    inline column restrictions emit "AuthorizeValue".
+    """
     out: dict = {}
     base = _local(restriction.get("base", ""))
     out["type"] = _BUILTIN.get(base, base)  # unknown base name -> a definitions key
@@ -83,7 +93,7 @@ def _facets(restriction: ET.Element) -> dict:
         elif name == "enumeration":
             enum.append(value)
     if enum:
-        out["AuthorizeValue"] = enum
+        out[enum_key] = enum
     return out
 
 
@@ -116,6 +126,39 @@ def _column(element: ET.Element, index: int) -> dict:
     return prop
 
 
+_PRIMITIVES = set(_BUILTIN.values())
+
+
+def _resolve_definitions(raw: dict) -> dict:
+    """Flatten named-type chains so every definition ends on a primitive type.
+
+    A definition whose `type` names another definition inherits that parent's
+    facets (recursively); facets set on the child override the inherited ones.
+    Raises ValueError on a circular reference.
+    """
+    resolved: dict = {}
+
+    def resolve(name: str, seen: frozenset) -> dict:
+        if name in resolved:
+            return resolved[name]
+        node = raw[name]
+        base = node.get("type", "string")
+        if base in _PRIMITIVES or base not in raw:
+            resolved[name] = dict(node)
+            return resolved[name]
+        if name in seen:
+            raise ValueError(f"circular type reference at '{name}'")
+        merged = dict(resolve(base, seen | {name}))   # parent facets + primitive type
+        child = {k: v for k, v in node.items() if k != "type"}
+        merged.update(child)                            # child facets win
+        resolved[name] = merged
+        return merged
+
+    for key in raw:
+        resolve(key, frozenset())
+    return resolved
+
+
 def convert(xsd_path: str) -> dict:
     """Parse the XSD and return the {definitions, properties} JSON structure."""
     root = ET.parse(xsd_path).getroot()
@@ -128,7 +171,7 @@ def convert(xsd_path: str) -> dict:
             continue
         for r in st:
             if _local(r.tag) == "restriction":
-                definitions[name] = _facets(r)
+                definitions[name] = _facets(r, enum_key="enum")
 
     # properties = the column elements, in document order.
     # A "column" is a named xs:element that either carries an inline restriction
@@ -144,7 +187,7 @@ def convert(xsd_path: str) -> dict:
         index += 1
         properties[name] = _column(el, index)
 
-    return {"definitions": definitions, "properties": properties}
+    return {"definitions": _resolve_definitions(definitions), "properties": properties}
 
 
 def main(argv: list[str]) -> int:

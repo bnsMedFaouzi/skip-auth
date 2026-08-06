@@ -1,206 +1,63 @@
-#!/usr/bin/env python3
-"""Convert an inventory XSD into the JSON schema consumed by csv_validator.
-
-Standalone: uses only the standard library and does NOT import the csv_validator
-package. It reads an .xsd whose columns are declared as <xs:element> (either with
-an inline <xs:simpleType>/<xs:restriction> or a type="<named>" reference), and
-emits JSON with `definitions` (named simpleTypes) and `properties` (columns, in
-document order), using the source keys the JSON parser understands (Size,
-TotalDigit, FractionDigit, AuthorizeValue, Mandatory, ColumnIndex, pattern...).
-
-Usage:
-    python xsd_to_json.py input.xsd output.json
-
-Mapping (documented, so you can eyeball it):
-  base xs:string                    -> "string"
-  base xs:decimal/float/double      -> "number"   (+ TotalDigit/FractionDigit)
-  base xs:integer/int/long/short    -> "integer"
-  base xs:date                      -> "date"
-  base xs:dateTime                  -> "timestamp"
-  base xs:boolean                   -> "boolean"
-  type="Foo" (no xs: builtin)       -> "Foo"      (a definitions key)
-
-A named simpleType may restrict *another* named simpleType (its <xs:restriction>
-base is a type name, not an xs: builtin). The consumer's parser only flattens one
-level, so such chains are resolved here at conversion time: every emitted
-definition is flattened down to a primitive type, inheriting the parent's facets,
-with the child's own facets winning.
-
-  xs:maxLength    -> Size
-  xs:totalDigits  -> TotalDigit
-  xs:fractionDigits -> FractionDigit
-  xs:enumeration  -> AuthorizeValue (list)
-  xs:pattern      -> pattern
-  xs:minInclusive -> minimum
-  nillable="false" -> Mandatory "Yes"   |   otherwise -> "No"
-  document order of the column elements -> ColumnIndex (1-based)
-
-Note: an XSD `xs:date`/`xs:dateTime` says the *logical* type, not the textual
-CSV format (e.g. "yyyyMMdd"). This script therefore does NOT emit a `Format`;
-set the engine's default_date_format / default_timestamp_format instead, or add
-Format by hand where a column needs a specific one.
-"""
+"""Engine configuration (Pydantic)."""
 
 from __future__ import annotations
 
-import json
-import sys
-import xml.etree.ElementTree as ET
-
-XSD_NS = "http://www.w3.org/2001/XMLSchema"
-
-# XSD builtin base types -> engine primitive type token.
-_BUILTIN = {
-    "string": "string", "normalizedString": "string", "token": "string",
-    "decimal": "number", "double": "number", "float": "number",
-    "integer": "integer", "int": "integer", "long": "integer",
-    "short": "integer", "nonNegativeInteger": "integer", "positiveInteger": "integer",
-    "date": "date",
-    "dateTime": "timestamp",
-    "boolean": "boolean",
-}
+from pydantic import BaseModel
 
 
-def _local(tag: str) -> str:
-    """Local name of a possibly namespaced tag or attribute value."""
-    return tag.rsplit("}", 1)[-1].rsplit(":", 1)[-1]
+class EngineConfig(BaseModel):
+    """Centralized engine parameters."""
+
+    sample_size: int = 20            # bounded error sample per check
+    streaming: bool = True           # use the Polars streaming engine
+
+    # header / file structure
+    strict_column_order: bool = True     # columns must match the schema order
+    header_gate: bool = True             # invalid header stops value validation
+    allow_extra_columns: bool = False    # tolerate CSV columns not in the schema
+
+    # default date/timestamp formats, used when a column does not provide one
+    default_date_format: str = "%Y-%m-%d"
+    default_timestamp_format: str = "%Y-%m-%dT%H:%M:%S"
+
+    # Rows per batch: bounds peak memory (a batch is evaluated then discarded).
+    # Leave as None to size it automatically from the column count so peak memory
+    # stays near `target_memory_mb` whatever the schema width; set an int to force it.
+    row_batch_size: int | None = None
+    target_memory_mb: int = 300          # memory budget used when auto-sizing the batch
+
+    @property
+    def engine_mode(self) -> str:
+        """The Polars collect engine: streaming when enabled, else auto."""
+        return "streaming" if self.streaming else "auto"
+
+    def batch_for(self, num_columns: int) -> int:
+        """Rows per batch for a schema of `num_columns` columns.
+
+        Returns `row_batch_size` if set. Otherwise sizes the batch so peak memory
+        stays near `target_memory_mb`: peak grows with (rows x columns), so the
+        row count is scaled down as the schema widens. Clamped to a safe range.
+        """
+        if self.row_batch_size is not None:
+            return self.row_batch_size
+        budget_bytes = max(self.target_memory_mb - _BASELINE_MB, 50) * 1_000_000
+        rows = int(budget_bytes / (_BYTES_PER_CELL * max(num_columns, 1)))
+        return max(_MIN_BATCH, min(rows, _MAX_BATCH))
+
+    def estimated_peak_mb(self, num_columns: int, rows_in_memory: int | None = None) -> float:
+        """A-priori peak-memory estimate (MB), the inverse of `batch_for`.
+
+        With streaming, only one batch is held at a time, so peak depends on the
+        batch size (used by default here) and the column count — NOT the total row
+        count. Pass `rows_in_memory` (e.g. the whole file's row count) to estimate
+        the in-memory case instead. Only as accurate as the calibration constants.
+        """
+        rows = rows_in_memory if rows_in_memory is not None else self.batch_for(num_columns)
+        return _BASELINE_MB + _BYTES_PER_CELL * rows * max(num_columns, 1) / 1_000_000
 
 
-def _facets(restriction: ET.Element, enum_key: str = "AuthorizeValue") -> dict:
-    """Read an <xs:restriction> into the source keys the parser understands.
-
-    `enum_key` selects the key used for enumerations: definitions emit "enum",
-    inline column restrictions emit "AuthorizeValue".
-    """
-    out: dict = {}
-    base = _local(restriction.get("base", ""))
-    out["type"] = _BUILTIN.get(base, base)  # unknown base name -> a definitions key
-
-    enum: list[str] = []
-    for facet in restriction:
-        name = _local(facet.tag)
-        value = facet.get("value")
-        if name == "maxLength":
-            out["Size"] = int(value)
-        elif name == "totalDigits":
-            out["TotalDigit"] = int(value)
-        elif name == "fractionDigits":
-            out["FractionDigit"] = int(value)
-        elif name == "pattern":
-            out["pattern"] = value
-        elif name == "minInclusive":
-            out["minimum"] = float(value)
-        elif name == "enumeration":
-            enum.append(value)
-    if enum:
-        out[enum_key] = enum
-    return out
-
-
-def _restriction_of(node: ET.Element) -> ET.Element | None:
-    """Return the <xs:restriction> under an element/simpleType, if any."""
-    for st in node:
-        if _local(st.tag) == "simpleType":
-            for r in st:
-                if _local(r.tag) == "restriction":
-                    return r
-    return None
-
-
-def _column(element: ET.Element, index: int) -> dict:
-    """Convert one column <xs:element> into a property dict."""
-    prop: dict = {}
-    typed = element.get("type")
-    restriction = _restriction_of(element)
-
-    if restriction is not None:
-        prop.update(_facets(restriction))
-    elif typed is not None:
-        base = _local(typed)
-        prop["type"] = _BUILTIN.get(base, base)  # named type -> definitions key
-    else:
-        prop["type"] = "string"  # bare element, no restriction: treat as free text
-
-    prop["Mandatory"] = "No" if element.get("nillable", "true") == "true" else "Yes"
-    prop["ColumnIndex"] = index
-    return prop
-
-
-_PRIMITIVES = set(_BUILTIN.values())
-
-
-def _resolve_definitions(raw: dict) -> dict:
-    """Flatten named-type chains so every definition ends on a primitive type.
-
-    A definition whose `type` names another definition inherits that parent's
-    facets (recursively); facets set on the child override the inherited ones.
-    Raises ValueError on a circular reference.
-    """
-    resolved: dict = {}
-
-    def resolve(name: str, seen: frozenset) -> dict:
-        if name in resolved:
-            return resolved[name]
-        node = raw[name]
-        base = node.get("type", "string")
-        if base in _PRIMITIVES or base not in raw:
-            resolved[name] = dict(node)
-            return resolved[name]
-        if name in seen:
-            raise ValueError(f"circular type reference at '{name}'")
-        merged = dict(resolve(base, seen | {name}))   # parent facets + primitive type
-        child = {k: v for k, v in node.items() if k != "type"}
-        merged.update(child)                            # child facets win
-        resolved[name] = merged
-        return merged
-
-    for key in raw:
-        resolve(key, frozenset())
-    return resolved
-
-
-def convert(xsd_path: str) -> dict:
-    """Parse the XSD and return the {definitions, properties} JSON structure."""
-    root = ET.parse(xsd_path).getroot()
-
-    # definitions = every named simpleType declared anywhere in the file.
-    definitions: dict = {}
-    for st in root.iter(f"{{{XSD_NS}}}simpleType"):
-        name = st.get("name")
-        if not name:
-            continue
-        for r in st:
-            if _local(r.tag) == "restriction":
-                definitions[name] = _facets(r, enum_key="enum")
-
-    # properties = the column elements, in document order.
-    # A "column" is a named xs:element that either carries an inline restriction
-    # or a type reference (this skips the schema's structural wrapper elements).
-    properties: dict = {}
-    index = 0
-    for el in root.iter(f"{{{XSD_NS}}}element"):
-        name = el.get("name")
-        if not name:
-            continue
-        if el.get("type") is None and _restriction_of(el) is None:
-            continue
-        index += 1
-        properties[name] = _column(el, index)
-
-    return {"definitions": _resolve_definitions(definitions), "properties": properties}
-
-
-def main(argv: list[str]) -> int:
-    if len(argv) != 3:
-        print("usage: python xsd_to_json.py input.xsd output.json", file=sys.stderr)
-        return 2
-    schema = convert(argv[1])
-    with open(argv[2], "w", encoding="utf-8") as fh:
-        json.dump(schema, fh, indent=2, ensure_ascii=False)
-    print(f"{len(schema['properties'])} columns, "
-          f"{len(schema['definitions'])} definitions -> {argv[2]}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
+# Empirical peak-memory model (measured): peak ~= baseline + bytes/cell * rows * cols.
+_BASELINE_MB = 60        # interpreter + Polars + one small block
+_BYTES_PER_CELL = 55     # per (row x column) at peak: Utf8 block + bool masks + intermediates
+_MIN_BATCH = 5_000       # keep some batching efficiency on very wide schemas
+_MAX_BATCH = 200_000     # cap on very narrow schemas

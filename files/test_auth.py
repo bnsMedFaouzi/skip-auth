@@ -1,63 +1,85 @@
-"""Engine configuration (Pydantic)."""
+#!/usr/bin/env python3
+"""Calibrate the memory model on a REAL file: find bytes_per_cell and baseline_mb.
 
-from __future__ import annotations
+Model:  peak_mb  ~=  baseline_mb  +  bytes_per_cell * rows_in_flight * series
+        series   =   columns + total checks (read from the schema + registry)
 
-from pydantic import BaseModel
+Runs several forced batch sizes, each in a FRESH process (clean peak on every OS,
+macOS included), then least-squares-fits a line through (rows*series, peak).
+Slope = bytes_per_cell, intercept = baseline_mb.
 
+Usage:  python calibrate.py <schema.json> <data.csv> <separator>
+"""
+import json
+import subprocess
+import sys
+import warnings
+from pathlib import Path
 
-class EngineConfig(BaseModel):
-    """Centralized engine parameters."""
+sys.path.insert(0, str(Path(__file__).resolve().parent / "csv_validator"))
+warnings.filterwarnings("ignore")
 
-    sample_size: int = 20            # bounded error sample per check
-    streaming: bool = True           # use the Polars streaming engine
-
-    # header / file structure
-    strict_column_order: bool = True     # columns must match the schema order
-    header_gate: bool = True             # invalid header stops value validation
-    allow_extra_columns: bool = False    # tolerate CSV columns not in the schema
-
-    # default date/timestamp formats, used when a column does not provide one
-    default_date_format: str = "%Y-%m-%d"
-    default_timestamp_format: str = "%Y-%m-%dT%H:%M:%S"
-
-    # Rows per batch: bounds peak memory (a batch is evaluated then discarded).
-    # Leave as None to size it automatically from the column count so peak memory
-    # stays near `target_memory_mb` whatever the schema width; set an int to force it.
-    row_batch_size: int | None = None
-    target_memory_mb: int = 300          # memory budget used when auto-sizing the batch
-
-    @property
-    def engine_mode(self) -> str:
-        """The Polars collect engine: streaming when enabled, else auto."""
-        return "streaming" if self.streaming else "auto"
-
-    def batch_for(self, num_columns: int) -> int:
-        """Rows per batch for a schema of `num_columns` columns.
-
-        Returns `row_batch_size` if set. Otherwise sizes the batch so peak memory
-        stays near `target_memory_mb`: peak grows with (rows x columns), so the
-        row count is scaled down as the schema widens. Clamped to a safe range.
-        """
-        if self.row_batch_size is not None:
-            return self.row_batch_size
-        budget_bytes = max(self.target_memory_mb - _BASELINE_MB, 50) * 1_000_000
-        rows = int(budget_bytes / (_BYTES_PER_CELL * max(num_columns, 1)))
-        return max(_MIN_BATCH, min(rows, _MAX_BATCH))
-
-    def estimated_peak_mb(self, num_columns: int, rows_in_memory: int | None = None) -> float:
-        """A-priori peak-memory estimate (MB), the inverse of `batch_for`.
-
-        With streaming, only one batch is held at a time, so peak depends on the
-        batch size (used by default here) and the column count — NOT the total row
-        count. Pass `rows_in_memory` (e.g. the whole file's row count) to estimate
-        the in-memory case instead. Only as accurate as the calibration constants.
-        """
-        rows = rows_in_memory if rows_in_memory is not None else self.batch_for(num_columns)
-        return _BASELINE_MB + _BYTES_PER_CELL * rows * max(num_columns, 1) / 1_000_000
+HERE = Path(__file__).resolve()
+BATCHES = [10_000, 20_000, 40_000, 80_000, 160_000]
 
 
-# Empirical peak-memory model (measured): peak ~= baseline + bytes/cell * rows * cols.
-_BASELINE_MB = 60        # interpreter + Polars + one small block
-_BYTES_PER_CELL = 55     # per (row x column) at peak: Utf8 block + bool masks + intermediates
-_MIN_BATCH = 5_000       # keep some batching efficiency on very wide schemas
-_MAX_BATCH = 200_000     # cap on very narrow schemas
+def _peak_mb() -> float:
+    with open("/proc/self/status") as fh:
+        for line in fh:
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1]) / 1024
+    return 0.0
+
+
+if len(sys.argv) == 6 and sys.argv[1] == "--measure":
+    import csv_validator as cv
+    _, _, schema, csv, sep, batch = sys.argv
+    cfg = cv.EngineConfig(row_batch_size=int(batch))
+    report = cv.validate(schema, csv, config=cfg, separator=sep)
+    print(json.dumps({"batch": int(batch), "rows": report.file.rows, "peak_mb": _peak_mb()}))
+    sys.exit(0)
+
+
+def _measure(schema, csv, sep, batch):
+    out = subprocess.run([sys.executable, str(HERE), "--measure", schema, csv, sep, str(batch)],
+                         capture_output=True, text=True)
+    if out.returncode:
+        raise RuntimeError(out.stderr)
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def main():
+    if len(sys.argv) != 4:
+        sys.exit("usage: python calibrate.py <schema.json> <data.csv> <separator>")
+    schema, csv, sep = sys.argv[1], sys.argv[2], sys.argv[3]
+
+    import csv_validator as cv
+    from csv_validator import JsonSchemaParser, default_registry
+    reg = default_registry(cv.EngineConfig())
+    columns = JsonSchemaParser(schema).parse()
+    series = len(columns) + sum(len(reg.checks_for(c)) for c in columns)
+    print(f"schema: {len(columns)} columns + {series - len(columns)} checks = {series} series\n")
+
+    pts = []
+    for b in BATCHES:
+        r = _measure(schema, csv, sep, b)
+        if r["rows"] < b:
+            print(f"  batch {b:>8,}  (file has only {r['rows']:,} rows -- skipped)")
+            continue
+        pts.append((b * series, r["peak_mb"]))
+        print(f"  batch {b:>8,}  peak {r['peak_mb']:6.0f} MB")
+
+    if len(pts) < 2:
+        sys.exit("\nNeed at least two batch sizes below the row count to calibrate.")
+
+    n = len(pts)
+    sx = sum(x for x, _ in pts); sy = sum(y for _, y in pts)
+    sxx = sum(x * x for x, _ in pts); sxy = sum(x * y for x, y in pts)
+    m = (n * sxy - sx * sy) / (n * sxx - sx * sx)
+    a = (sy - m * sx) / n
+    print(f"\nfit: bytes_per_cell = {m * 1e6:.1f}   baseline_mb = {a:.0f}")
+    print(f"\n    EngineConfig(bytes_per_cell={m * 1e6:.0f}, baseline_mb={max(a, 0):.0f})")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,84 +1,95 @@
 #!/usr/bin/env python3
-"""Calibrate the memory model on a REAL file: find bytes_per_cell and baseline_mb.
+"""Calibrate the GLOBAL memory model (mem_base, mem_coeff, mem_exponent) on YOUR corpus.
 
-Model:  peak_mb  ~=  baseline_mb  +  bytes_per_cell * rows_in_flight * series
-        series   =   columns + total checks (read from the schema + registry)
+Give several (schema, csv) pairs spanning your file diversity (numeric-heavy,
+text-heavy, wide, narrow...). For each, W is computed from the schema and peaks
+are measured at a few batch sizes (isolated processes). A grid + least-squares
+fit returns the three constants to paste into EngineConfig, plus a leave-one-file
+-out error estimate (how well it predicts a file it never saw).
 
-Runs several forced batch sizes, each in a FRESH process (clean peak on every OS,
-macOS included), then least-squares-fits a line through (rows*series, peak).
-Slope = bytes_per_cell, intercept = baseline_mb.
-
-Usage:  python calibrate.py <schema.json> <data.csv> <separator>
+Usage:
+    python calibrate_model.py [--sep ';'] schema1.json csv1.csv schema2.json csv2.csv ...
 """
-import json
 import subprocess
 import sys
-import warnings
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "csv_validator"))
-warnings.filterwarnings("ignore")
+import numpy as np
 
-HERE = Path(__file__).resolve()
-BATCHES = [10_000, 20_000, 40_000, 80_000, 160_000]
+sys.path.insert(0, str(Path(__file__).resolve().parent / "csv_validator"))  # remove/adjust in your env
+import csv_validator as cv
+from csv_validator import JsonSchemaParser, default_registry
+
+BATCHES = [10_000, 20_000, 40_000]
 
 
-def _peak_mb() -> float:
+def _peak_mb():
     with open("/proc/self/status") as fh:
         for line in fh:
             if line.startswith("VmHWM:"):
                 return int(line.split()[1]) / 1024
-    return 0.0
 
 
 if len(sys.argv) == 6 and sys.argv[1] == "--measure":
-    import csv_validator as cv
     _, _, schema, csv, sep, batch = sys.argv
-    cfg = cv.EngineConfig(row_batch_size=int(batch))
-    report = cv.validate(schema, csv, config=cfg, separator=sep)
-    print(json.dumps({"batch": int(batch), "rows": report.file.rows, "peak_mb": _peak_mb()}))
-    sys.exit(0)
+    cv.validate(schema, csv, config=cv.EngineConfig(row_batch_size=int(batch)), separator=sep)
+    print(_peak_mb()); sys.exit(0)
 
 
-def _measure(schema, csv, sep, batch):
-    out = subprocess.run([sys.executable, str(HERE), "--measure", schema, csv, sep, str(batch)],
+def w_of(schema):
+    cfg = cv.EngineConfig(); reg = default_registry(cfg)
+    cols = JsonSchemaParser(schema).parse()
+    return cfg.row_weight(cols, sum(len(reg.checks_for(c)) for c in cols))
+
+
+def measure(schema, csv, sep, b):
+    out = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--measure", schema, csv, sep, str(b)],
                          capture_output=True, text=True)
     if out.returncode:
         raise RuntimeError(out.stderr)
-    return json.loads(out.stdout.strip().splitlines()[-1])
+    return float(out.stdout.strip().splitlines()[-1])
+
+
+def fit(x, y):
+    best = None
+    for p in np.linspace(0.30, 0.90, 121):
+        xp = x ** p
+        (base, coeff), *_ = np.linalg.lstsq(np.vstack([np.ones_like(xp), xp]).T, y, rcond=None)
+        rmse = float(np.sqrt(np.mean((base + coeff * xp - y) ** 2)))
+        if best is None or rmse < best[0]:
+            best = (rmse, float(base), float(coeff), float(p))
+    return best
 
 
 def main():
-    if len(sys.argv) != 4:
-        sys.exit("usage: python calibrate.py <schema.json> <data.csv> <separator>")
-    schema, csv, sep = sys.argv[1], sys.argv[2], sys.argv[3]
+    args = sys.argv[1:]
+    sep = ";"
+    if args and args[0] == "--sep":
+        sep, args = args[1], args[2:]
+    pairs = list(zip(args[0::2], args[1::2]))
+    if len(pairs) < 3:
+        sys.exit("give at least 3 (schema csv) pairs spanning your file diversity")
 
-    import csv_validator as cv
-    from csv_validator import JsonSchemaParser, default_registry
-    reg = default_registry(cv.EngineConfig())
-    columns = JsonSchemaParser(schema).parse()
-    series = len(columns) + sum(len(reg.checks_for(c)) for c in columns)
-    print(f"schema: {len(columns)} columns + {series - len(columns)} checks = {series} series\n")
+    per_file, X, Y = [], [], []
+    for schema, csv in pairs:
+        W = w_of(schema); pts = []
+        for b in BATCHES:
+            pk = measure(schema, csv, sep, b); X.append(b * W); Y.append(pk); pts.append((b, W, pk))
+        per_file.append(pts)
+        print(f"{Path(schema).name}: W={W:.0f}  peaks={[round(p) for _, _, p in pts]}")
 
-    pts = []
-    for b in BATCHES:
-        r = _measure(schema, csv, sep, b)
-        if r["rows"] < b:
-            print(f"  batch {b:>8,}  (file has only {r['rows']:,} rows -- skipped)")
-            continue
-        pts.append((b * series, r["peak_mb"]))
-        print(f"  batch {b:>8,}  peak {r['peak_mb']:6.0f} MB")
+    rmse, base, coeff, p = fit(np.array(X), np.array(Y))
+    print(f"\nfit: mem_base={base:.0f}  mem_coeff={coeff:.5f}  mem_exponent={p:.3f}  (RMSE={rmse:.0f} MB)")
 
-    if len(pts) < 2:
-        sys.exit("\nNeed at least two batch sizes below the row count to calibrate.")
-
-    n = len(pts)
-    sx = sum(x for x, _ in pts); sy = sum(y for _, y in pts)
-    sxx = sum(x * x for x, _ in pts); sxy = sum(x * y for x, y in pts)
-    m = (n * sxy - sx * sy) / (n * sxx - sx * sx)
-    a = (sy - m * sx) / n
-    print(f"\nfit: bytes_per_cell = {m * 1e6:.1f}   baseline_mb = {a:.0f}")
-    print(f"\n    EngineConfig(bytes_per_cell={m * 1e6:.0f}, baseline_mb={max(a, 0):.0f})")
+    errs = []
+    for i, pts in enumerate(per_file):
+        tr = [(b * w, pk) for j, o in enumerate(per_file) if j != i for b, w, pk in o]
+        tx, ty = np.array([a for a, _ in tr]), np.array([a for _, a in tr])
+        _, b0, c0, p0 = fit(tx, ty)
+        for b, w, pk in pts:
+            errs.append(abs(b0 + c0 * (b * w) ** p0 - pk) / pk)
+    print(f"leave-one-file-out: mean|err|={np.mean(errs)*100:.1f}%  max|err|={np.max(errs)*100:.1f}%")
+    print(f"\n    EngineConfig(mem_base={base:.0f}, mem_coeff={coeff:.5f}, mem_exponent={p:.3f})")
 
 
 if __name__ == "__main__":

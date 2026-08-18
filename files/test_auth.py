@@ -1,231 +1,212 @@
-"""PROTOTYPE — not wired into the package (no codebase changes).
+"""PROTOTYPE — row constraints as typed classes, mirroring column constraints.
 
-Shows the three classes we discussed:
+Symmetry with the column side:
+    Constraint (ABC)         ->  RowConstraint (ABC)
+    Minimum, MaxLength, ...  ->  Compare, RequiredIf, Equals, MutuallyRequired  (typed dataclasses)
+    ValidatorRegistry        ->  RowConstraintRegistry
+    produces BoundCheck      ->  produces RowCheck
 
-  MaskProcessor  (base)  — evaluate a set of named boolean masks over a block in a
-                           single Polars collect, and accumulate per-mask a failing
-                           count + a bounded sample (absolute line no. + value(s)).
-  ColumnRunner   (sub)   — per-column checks; adds the per-column failing-row count
-                           and regroups results under each column (today's behavior).
-  RowRunner      (sub)   — cross-column integrity checks; sample shows the involved
-                           columns; flat result list. Almost empty — the sign the
-                           split is right.
-
-Only `_build_sample_expr`, `_sample_payload` and `_assemble` vary between the two
-subclasses; everything else lives once in the base. Both run as independent
-`BlockProcessor`s (separate collect each) — the Runner already accepts a list.
+Each constraint is a dataclass carrying ONLY its own parameters (no generic dict),
+and knows how to produce its involved `columns()` (for the sample) and its
+`invalid()` Polars mask (True = the row violates). `to_check()` wraps it into the
+`RowCheck` consumed by `RowRunner`. Adding a new kind = a new dataclass + register.
+Not wired into the package.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 
 import polars as pl
 
-from csv_validator.models import BoundCheck          # existing: .column / .check / .invalid
-from csv_validator.execution.runner import BlockProcessor
-
-ROW_IDX = "__row__"  # transient per-block row index used to number samples
+from mask_processors import RowCheck   # prototype dataclass: name / columns / invalid
 
 
 # --------------------------------------------------------------------------- #
-# The cross-column rule object (mirrors BoundCheck; would live in validators/rows)
+# helpers: read a CSV cell (Utf8) as a typed value for comparisons
+# --------------------------------------------------------------------------- #
+_OPS = {
+    ">": lambda a, b: a > b, ">=": lambda a, b: a >= b,
+    "<": lambda a, b: a < b, "<=": lambda a, b: a <= b,
+    "==": lambda a, b: a == b, "!=": lambda a, b: a != b,
+}
+
+
+def _typed(name: str, cast: str | None) -> pl.Expr:
+    """Column `name` (stored as Utf8) coerced to the type needed for a comparison."""
+    e = pl.col(name).cast(pl.Utf8)
+    if cast == "date":
+        return e.str.to_date(strict=False)
+    if cast == "timestamp":
+        return e.str.to_datetime(strict=False)
+    if cast in ("number", "integer"):
+        return e.cast(pl.Float64 if cast == "number" else pl.Int64, strict=False)
+    return e                                                        # plain string compare
+
+
+# --------------------------------------------------------------------------- #
+# base
+# --------------------------------------------------------------------------- #
+class RowConstraint(ABC):
+    """A cross-column integrity rule, declared by the schema. Mirrors `Constraint`."""
+
+    kind: str = "row"
+    name: str
+
+    @abstractmethod
+    def columns(self) -> list[str]:
+        """Columns this rule involves (shown in the sample)."""
+
+    @abstractmethod
+    def invalid(self) -> pl.Expr:
+        """Boolean mask, True where a row violates the rule."""
+
+    def to_check(self) -> RowCheck:
+        """Wrap into the RowCheck consumed by the batch processor."""
+        return RowCheck(name=self.name, columns=self.columns(), invalid=self.invalid())
+
+    @classmethod
+    @abstractmethod
+    def from_dict(cls, d: dict) -> "RowConstraint":
+        """Build a typed instance from its schema definition."""
+
+
+# --------------------------------------------------------------------------- #
+# concrete, typed constraints — each carries only its own parameters
 # --------------------------------------------------------------------------- #
 @dataclass
-class RowCheck:
-    """A vectorized integrity rule over a whole row: name, involved columns, mask."""
+class Compare(RowConstraint):
+    """`left op right` must hold on each row (e.g. EndDate >= StartDate)."""
 
+    kind = "compare"
     name: str
-    columns: list[str]
-    invalid: pl.Expr            # boolean expr combining several columns; True = violation
+    left: str
+    op: str
+    right: str
+    cast: str | None = None          # "date" / "number" / "integer" / None (string)
+
+    def columns(self) -> list[str]:
+        return [self.left, self.right]
+
+    def invalid(self) -> pl.Expr:
+        rule_ok = _OPS[self.op](_typed(self.left, self.cast), _typed(self.right, self.cast))
+        return ~rule_ok               # violation = rule does not hold (null -> not flagged)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Compare":
+        if d["op"] not in _OPS:
+            raise ValueError(f"compare: unknown op {d['op']!r}")
+        return cls(name=d["name"], left=d["left"], op=d["op"], right=d["right"], cast=d.get("cast"))
 
 
-# Result shapes
-CheckData = tuple[str, int, list[tuple[int, Any]]]     # (name, error_count, sample)
-ColumnData = tuple[str, int, list[CheckData]]          # (column, failing_rows, checks)
-RowData = CheckData                                    # (name, error_count, sample)
+@dataclass
+class RequiredIf(RowConstraint):
+    """If `when_col == equals`, then `require` must be present (non-empty)."""
+
+    kind = "requiredIf"
+    name: str
+    when_col: str
+    equals: str
+    require: str
+
+    def columns(self) -> list[str]:
+        return [self.when_col, self.require]
+
+    def invalid(self) -> pl.Expr:
+        req = pl.col(self.require).cast(pl.Utf8)
+        missing = req.is_null() | (req.str.len_chars() == 0)
+        return (pl.col(self.when_col).cast(pl.Utf8) == self.equals) & missing
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RequiredIf":
+        return cls(name=d["name"], when_col=d["whenCol"], equals=d["equals"], require=d["require"])
 
 
 # --------------------------------------------------------------------------- #
-# Base: one collect over a block -> counts + bounded samples per mask
+# registry: kind -> class (mirrors ValidatorRegistry / default_registry)
+@dataclass
+class Equals(RowConstraint):
+    """Two columns must hold the same value on each row (e.g. Ccy == SettlementCcy)."""
+
+    kind = "equals"
+    name: str
+    left: str
+    right: str
+
+    def columns(self) -> list[str]:
+        return [self.left, self.right]
+
+    def invalid(self) -> pl.Expr:
+        return pl.col(self.left).cast(pl.Utf8) != pl.col(self.right).cast(pl.Utf8)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Equals":
+        return cls(name=d["name"], left=d["left"], right=d["right"])
+
+
+@dataclass
+class MutuallyRequired(RowConstraint):
+    """Two columns must be present together or absent together (not one without the other)."""
+
+    kind = "mutuallyRequired"
+    name: str
+    left: str
+    right: str
+
+    def columns(self) -> list[str]:
+        return [self.left, self.right]
+
+    def invalid(self) -> pl.Expr:
+        def filled(c: str) -> pl.Expr:
+            v = pl.col(c).cast(pl.Utf8)
+            return v.is_not_null() & (v.str.len_chars() > 0)
+        return filled(self.left) != filled(self.right)          # exactly one filled -> violation
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MutuallyRequired":
+        return cls(name=d["name"], left=d["left"], right=d["right"])
+
+
 # --------------------------------------------------------------------------- #
-class MaskProcessor(BlockProcessor):
-    """Evaluate named boolean masks over each block and accumulate their results.
+class RowConstraintRegistry:
+    """Holds the known constraint classes (built-in + custom) and builds RowChecks."""
 
-    Knows nothing about "column" or "row": it works on any objects exposing an
-    ``.invalid`` Polars expression. Per block it runs ONE streaming collect that
-    computes, for every mask ``m{i}``: the failing count and a bounded sample.
-    Subclasses decide only what a sample looks like and how to shape the result.
-    """
+    def __init__(self) -> None:
+        self._by_kind: dict[str, type[RowConstraint]] = {}
 
-    def __init__(self, checks: list[Any], sample_size: int, engine: str = "streaming") -> None:
-        self._checks = list(checks)                       # each exposes `.invalid`
-        self._sample_size = sample_size
-        self._engine = engine
-        # Data-independent expressions, built once and reused every block.
-        self._masks = self._mask_exprs()
-        self._rows_expr = pl.len().alias("rows")
-        self._count_exprs = self._make_count_exprs()
-        self._sample_exprs = self._make_sample_exprs()
-        # Accumulators, parallel to `_checks`.
-        self._counts = [0] * len(self._checks)
-        self._samples: list[list[tuple[int, Any]]] = [[] for _ in self._checks]
-        self._needs_sample = [sample_size > 0 for _ in self._checks]
+    def register(self, constraint_cls: type[RowConstraint]) -> "RowConstraintRegistry":
+        """Register a constraint class by its `kind`. Returns self for chaining."""
+        self._by_kind[constraint_cls.kind] = constraint_cls
+        return self
 
-    # -- BlockProcessor interface ------------------------------------------- #
-    def update(self, block: pl.LazyFrame, offset: int) -> int:
-        """Evaluate one block, fold it in, and return its row count.
+    def build(self, definitions: list[dict], columns: list[str]) -> list[RowCheck]:
+        """Turn the schema's row-constraint definitions into RowChecks.
 
-        ``offset`` (rows seen before this block) makes sample line numbers absolute.
+        Each definition is resolved to its typed constraint, then validated: the
+        `kind` must be known and every column it references must exist in the
+        schema (`columns`). Anything else raises a clear error, like the parser.
         """
-        row = self._evaluate(block)
-        self._accumulate(row, offset)
-        return int(row["rows"])
-
-    def result(self) -> Any:
-        return self._assemble()
-
-    # -- one Polars pass over one block ------------------------------------- #
-    def _evaluate(self, block: pl.LazyFrame) -> dict:
-        """Attach masks + aggregates to the lazy block, collect once, return one row."""
-        return (
-            block.with_row_index(ROW_IDX)
-            .with_columns(self._masks)
-            .select(self._aggregates())
-            .collect(engine=self._engine)
-            .row(0, named=True)
-        )
-
-    def _aggregates(self) -> list[pl.Expr]:
-        """Row count, per-mask counts, and the samples still being collected."""
-        samples = [self._sample_exprs[i] for i in range(len(self._checks)) if self._needs_sample[i]]
-        return [self._rows_expr, *self._count_exprs, *samples]
-
-    # -- expression builders (each list built once) ------------------------- #
-    def _mask_exprs(self) -> list[pl.Expr]:
-        """One invalid-mask ``m{i}`` per check (null cells are not invalid here)."""
-        return [chk.invalid.fill_null(False).alias(f"m{i}") for i, chk in enumerate(self._checks)]
-
-    def _make_count_exprs(self) -> list[pl.Expr]:
-        """One failing-row count per mask (the sum of its mask)."""
-        return [pl.col(f"m{i}").sum().alias(f"count:{i}") for i in range(len(self._checks))]
-
-    def _make_sample_exprs(self) -> list[pl.Expr]:
-        """One bounded sample per mask; the projection is subclass-specific."""
-        return [
-            self._build_sample_expr(i, chk)
-            .filter(pl.col(f"m{i}"))
-            .head(self._sample_size)
-            .implode()
-            .alias(f"sample:{i}")
-            for i, chk in enumerate(self._checks)
-        ]
-
-    # -- accumulation across blocks ----------------------------------------- #
-    def _accumulate(self, row: dict, offset: int) -> None:
-        """Add one block's counts and samples to the totals."""
-        for i in range(len(self._checks)):
-            self._counts[i] += int(row[f"count:{i}"] or 0)
-            if self._needs_sample[i]:
-                self._collect_sample(i, row, offset)
-
-    def _collect_sample(self, i: int, row: dict, offset: int) -> None:
-        """Append mask ``i``'s sample rows (offset-shifted), stopping once it is full."""
-        for rec in row[f"sample:{i}"] or []:
-            if len(self._samples[i]) >= self._sample_size:
-                self._needs_sample[i] = False
-                return
-            line = offset + int(rec["line"])
-            self._samples[i].append((line, self._sample_payload(self._checks[i], rec)))
-
-    # -- variation points (subclasses) -------------------------------------- #
-    def _build_sample_expr(self, index: int, check: Any) -> pl.Expr:
-        """The struct projected for a sample row (must include a ``line`` field)."""
-        raise NotImplementedError
-
-    def _sample_payload(self, check: Any, rec: dict) -> Any:
-        """Turn one collected sample struct into the stored value(s)."""
-        raise NotImplementedError
-
-    def _assemble(self) -> Any:
-        """Shape the accumulated results for the report."""
-        raise NotImplementedError
+        known = set(columns)
+        checks: list[RowCheck] = []
+        for d in definitions:
+            kind = d.get("kind")
+            cls = self._by_kind.get(kind)
+            if cls is None:
+                raise ValueError(f"unknown row constraint kind: {kind!r}")
+            constraint = cls.from_dict(d)
+            missing = [c for c in constraint.columns() if c not in known]
+            if missing:
+                raise ValueError(
+                    f"row constraint {constraint.name!r}: unknown column(s) {', '.join(missing)}"
+                )
+            checks.append(constraint.to_check())
+        return checks
 
 
-# --------------------------------------------------------------------------- #
-# Column checks: + per-column failing-row count, regrouped by column
-# --------------------------------------------------------------------------- #
-class ColumnRunner(MaskProcessor):
-    """Per-column checks. Adds the per-column failing-row count on top of the base."""
-
-    def __init__(self, checks_by_column: dict[str, list[BoundCheck]], sample_size: int,
-                 engine: str = "streaming") -> None:
-        flat = [chk for chks in checks_by_column.values() for chk in chks]
-        super().__init__(flat, sample_size, engine)          # base handles masks/counts/samples
-        self._col_indices = self._group_by_column()          # column -> its check indices
-        self._colfail_exprs = self._make_colfail_exprs()
-        self._colfail = {col: 0 for col in self._col_indices}
-
-    def _group_by_column(self) -> dict[str, list[int]]:
-        indices: dict[str, list[int]] = {}
-        for i, chk in enumerate(self._checks):
-            indices.setdefault(chk.column, []).append(i)
-        return indices
-
-    def _make_colfail_exprs(self) -> list[pl.Expr]:
-        """One failing-row count per column (a row failing several checks counts once)."""
-        return [
-            pl.any_horizontal([pl.col(f"m{k}") for k in idxs]).sum().alias(f"colfail:{col}")
-            for col, idxs in self._col_indices.items()
-        ]
-
-    # extend the base collect + accumulation with the per-column supplement
-    def _aggregates(self) -> list[pl.Expr]:
-        return [*super()._aggregates(), *self._colfail_exprs]
-
-    def _accumulate(self, row: dict, offset: int) -> None:
-        super()._accumulate(row, offset)
-        for col in self._colfail:
-            self._colfail[col] += int(row[f"colfail:{col}"] or 0)
-
-    # variation points
-    def _build_sample_expr(self, index: int, check: BoundCheck) -> pl.Expr:
-        return pl.struct(
-            (pl.col(ROW_IDX) + 1).alias("line"),
-            pl.col(check.column).cast(pl.Utf8).alias("value"),
-        )
-
-    def _sample_payload(self, check: BoundCheck, rec: dict) -> str:
-        value = rec["value"]
-        return value if value is not None else ""
-
-    def _assemble(self) -> list[ColumnData]:
-        """Regroup the flat results under their column, in schema order."""
-        return [
-            (col, self._colfail[col],
-             [(self._checks[i].check, self._counts[i], self._samples[i]) for i in idxs])
-            for col, idxs in self._col_indices.items()
-        ]
-
-
-# --------------------------------------------------------------------------- #
-# Row checks: cross-column; sample shows the involved columns; flat result
-# --------------------------------------------------------------------------- #
-class RowRunner(MaskProcessor):
-    """Cross-column integrity checks. Nearly empty — only the two variation points."""
-
-    def __init__(self, checks: list[RowCheck], sample_size: int, engine: str = "streaming") -> None:
-        super().__init__(checks, sample_size, engine)
-
-    def _build_sample_expr(self, index: int, check: RowCheck) -> pl.Expr:
-        return pl.struct(
-            (pl.col(ROW_IDX) + 1).alias("line"),
-            *[pl.col(c).cast(pl.Utf8).alias(c) for c in check.columns],
-        )
-
-    def _sample_payload(self, check: RowCheck, rec: dict) -> dict[str, str]:
-        return {c: (rec[c] if rec[c] is not None else "") for c in check.columns}
-
-    def _assemble(self) -> list[RowData]:
-        return [(chk.name, self._counts[i], self._samples[i]) for i, chk in enumerate(self._checks)]
+def default_row_registry() -> RowConstraintRegistry:
+    """The built-in constraints (extend with `.register(MyConstraint)`)."""
+    reg = RowConstraintRegistry()
+    for cls in (Compare, RequiredIf, Equals, MutuallyRequired):
+        reg.register(cls)
+    return reg

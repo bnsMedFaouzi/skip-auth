@@ -1,96 +1,231 @@
-#!/usr/bin/env python3
-"""Calibrate the GLOBAL memory model (mem_base, mem_coeff, mem_exponent) on YOUR corpus.
+"""PROTOTYPE — not wired into the package (no codebase changes).
 
-Give several (schema, csv) pairs spanning your file diversity (numeric-heavy,
-text-heavy, wide, narrow...). For each, W is computed from the schema and peaks
-are measured at a few batch sizes (isolated processes). A grid + least-squares
-fit returns the three constants to paste into EngineConfig, plus a leave-one-file
--out error estimate (how well it predicts a file it never saw).
+Shows the three classes we discussed:
 
-Usage:
-    python calibrate_model.py [--sep ';'] schema1.json csv1.csv schema2.json csv2.csv ...
+  MaskProcessor  (base)  — evaluate a set of named boolean masks over a block in a
+                           single Polars collect, and accumulate per-mask a failing
+                           count + a bounded sample (absolute line no. + value(s)).
+  ColumnRunner   (sub)   — per-column checks; adds the per-column failing-row count
+                           and regroups results under each column (today's behavior).
+  RowRunner      (sub)   — cross-column integrity checks; sample shows the involved
+                           columns; flat result list. Almost empty — the sign the
+                           split is right.
+
+Only `_build_sample_expr`, `_sample_payload` and `_assemble` vary between the two
+subclasses; everything else lives once in the base. Both run as independent
+`BlockProcessor`s (separate collect each) — the Runner already accepts a list.
 """
-import subprocess
-import sys
-from pathlib import Path
 
-import numpy as np
+from __future__ import annotations
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "csv_validator"))  # remove/adjust in your env
-import csv_validator as cv
-from csv_validator import JsonSchemaParser, default_registry
+from dataclasses import dataclass
+from typing import Any
 
-BATCHES = [10_000, 20_000, 40_000]
+import polars as pl
 
+from csv_validator.models import BoundCheck          # existing: .column / .check / .invalid
+from csv_validator.execution.runner import BlockProcessor
 
-def _peak_mb():
-    with open("/proc/self/status") as fh:
-        for line in fh:
-            if line.startswith("VmHWM:"):
-                return int(line.split()[1]) / 1024
+ROW_IDX = "__row__"  # transient per-block row index used to number samples
 
 
-if len(sys.argv) == 6 and sys.argv[1] == "--measure":
-    _, _, schema, csv, sep, batch = sys.argv
-    cv.validate(schema, csv, config=cv.EngineConfig(row_batch_size=int(batch)), separator=sep)
-    print(_peak_mb()); sys.exit(0)
+# --------------------------------------------------------------------------- #
+# The cross-column rule object (mirrors BoundCheck; would live in validators/rows)
+# --------------------------------------------------------------------------- #
+@dataclass
+class RowCheck:
+    """A vectorized integrity rule over a whole row: name, involved columns, mask."""
+
+    name: str
+    columns: list[str]
+    invalid: pl.Expr            # boolean expr combining several columns; True = violation
 
 
-def w_of(schema):
-    cfg = cv.EngineConfig(); reg = default_registry(cfg)
-    cols = JsonSchemaParser(schema).parse()
-    return cfg.row_weight(cols, sum(len(reg.checks_for(c)) for c in cols))
+# Result shapes
+CheckData = tuple[str, int, list[tuple[int, Any]]]     # (name, error_count, sample)
+ColumnData = tuple[str, int, list[CheckData]]          # (column, failing_rows, checks)
+RowData = CheckData                                    # (name, error_count, sample)
 
 
-def measure(schema, csv, sep, b):
-    out = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--measure", schema, csv, sep, str(b)],
-                         capture_output=True, text=True)
-    if out.returncode:
-        raise RuntimeError(out.stderr)
-    return float(out.stdout.strip().splitlines()[-1])
+# --------------------------------------------------------------------------- #
+# Base: one collect over a block -> counts + bounded samples per mask
+# --------------------------------------------------------------------------- #
+class MaskProcessor(BlockProcessor):
+    """Evaluate named boolean masks over each block and accumulate their results.
+
+    Knows nothing about "column" or "row": it works on any objects exposing an
+    ``.invalid`` Polars expression. Per block it runs ONE streaming collect that
+    computes, for every mask ``m{i}``: the failing count and a bounded sample.
+    Subclasses decide only what a sample looks like and how to shape the result.
+    """
+
+    def __init__(self, checks: list[Any], sample_size: int, engine: str = "streaming") -> None:
+        self._checks = list(checks)                       # each exposes `.invalid`
+        self._sample_size = sample_size
+        self._engine = engine
+        # Data-independent expressions, built once and reused every block.
+        self._masks = self._mask_exprs()
+        self._rows_expr = pl.len().alias("rows")
+        self._count_exprs = self._make_count_exprs()
+        self._sample_exprs = self._make_sample_exprs()
+        # Accumulators, parallel to `_checks`.
+        self._counts = [0] * len(self._checks)
+        self._samples: list[list[tuple[int, Any]]] = [[] for _ in self._checks]
+        self._needs_sample = [sample_size > 0 for _ in self._checks]
+
+    # -- BlockProcessor interface ------------------------------------------- #
+    def update(self, block: pl.LazyFrame, offset: int) -> int:
+        """Evaluate one block, fold it in, and return its row count.
+
+        ``offset`` (rows seen before this block) makes sample line numbers absolute.
+        """
+        row = self._evaluate(block)
+        self._accumulate(row, offset)
+        return int(row["rows"])
+
+    def result(self) -> Any:
+        return self._assemble()
+
+    # -- one Polars pass over one block ------------------------------------- #
+    def _evaluate(self, block: pl.LazyFrame) -> dict:
+        """Attach masks + aggregates to the lazy block, collect once, return one row."""
+        return (
+            block.with_row_index(ROW_IDX)
+            .with_columns(self._masks)
+            .select(self._aggregates())
+            .collect(engine=self._engine)
+            .row(0, named=True)
+        )
+
+    def _aggregates(self) -> list[pl.Expr]:
+        """Row count, per-mask counts, and the samples still being collected."""
+        samples = [self._sample_exprs[i] for i in range(len(self._checks)) if self._needs_sample[i]]
+        return [self._rows_expr, *self._count_exprs, *samples]
+
+    # -- expression builders (each list built once) ------------------------- #
+    def _mask_exprs(self) -> list[pl.Expr]:
+        """One invalid-mask ``m{i}`` per check (null cells are not invalid here)."""
+        return [chk.invalid.fill_null(False).alias(f"m{i}") for i, chk in enumerate(self._checks)]
+
+    def _make_count_exprs(self) -> list[pl.Expr]:
+        """One failing-row count per mask (the sum of its mask)."""
+        return [pl.col(f"m{i}").sum().alias(f"count:{i}") for i in range(len(self._checks))]
+
+    def _make_sample_exprs(self) -> list[pl.Expr]:
+        """One bounded sample per mask; the projection is subclass-specific."""
+        return [
+            self._build_sample_expr(i, chk)
+            .filter(pl.col(f"m{i}"))
+            .head(self._sample_size)
+            .implode()
+            .alias(f"sample:{i}")
+            for i, chk in enumerate(self._checks)
+        ]
+
+    # -- accumulation across blocks ----------------------------------------- #
+    def _accumulate(self, row: dict, offset: int) -> None:
+        """Add one block's counts and samples to the totals."""
+        for i in range(len(self._checks)):
+            self._counts[i] += int(row[f"count:{i}"] or 0)
+            if self._needs_sample[i]:
+                self._collect_sample(i, row, offset)
+
+    def _collect_sample(self, i: int, row: dict, offset: int) -> None:
+        """Append mask ``i``'s sample rows (offset-shifted), stopping once it is full."""
+        for rec in row[f"sample:{i}"] or []:
+            if len(self._samples[i]) >= self._sample_size:
+                self._needs_sample[i] = False
+                return
+            line = offset + int(rec["line"])
+            self._samples[i].append((line, self._sample_payload(self._checks[i], rec)))
+
+    # -- variation points (subclasses) -------------------------------------- #
+    def _build_sample_expr(self, index: int, check: Any) -> pl.Expr:
+        """The struct projected for a sample row (must include a ``line`` field)."""
+        raise NotImplementedError
+
+    def _sample_payload(self, check: Any, rec: dict) -> Any:
+        """Turn one collected sample struct into the stored value(s)."""
+        raise NotImplementedError
+
+    def _assemble(self) -> Any:
+        """Shape the accumulated results for the report."""
+        raise NotImplementedError
 
 
-def fit(x, y):
-    best = None
-    for p in np.linspace(0.30, 0.90, 121):
-        xp = x ** p
-        (base, coeff), *_ = np.linalg.lstsq(np.vstack([np.ones_like(xp), xp]).T, y, rcond=None)
-        rmse = float(np.sqrt(np.mean((base + coeff * xp - y) ** 2)))
-        if best is None or rmse < best[0]:
-            best = (rmse, float(base), float(coeff), float(p))
-    return best
+# --------------------------------------------------------------------------- #
+# Column checks: + per-column failing-row count, regrouped by column
+# --------------------------------------------------------------------------- #
+class ColumnRunner(MaskProcessor):
+    """Per-column checks. Adds the per-column failing-row count on top of the base."""
+
+    def __init__(self, checks_by_column: dict[str, list[BoundCheck]], sample_size: int,
+                 engine: str = "streaming") -> None:
+        flat = [chk for chks in checks_by_column.values() for chk in chks]
+        super().__init__(flat, sample_size, engine)          # base handles masks/counts/samples
+        self._col_indices = self._group_by_column()          # column -> its check indices
+        self._colfail_exprs = self._make_colfail_exprs()
+        self._colfail = {col: 0 for col in self._col_indices}
+
+    def _group_by_column(self) -> dict[str, list[int]]:
+        indices: dict[str, list[int]] = {}
+        for i, chk in enumerate(self._checks):
+            indices.setdefault(chk.column, []).append(i)
+        return indices
+
+    def _make_colfail_exprs(self) -> list[pl.Expr]:
+        """One failing-row count per column (a row failing several checks counts once)."""
+        return [
+            pl.any_horizontal([pl.col(f"m{k}") for k in idxs]).sum().alias(f"colfail:{col}")
+            for col, idxs in self._col_indices.items()
+        ]
+
+    # extend the base collect + accumulation with the per-column supplement
+    def _aggregates(self) -> list[pl.Expr]:
+        return [*super()._aggregates(), *self._colfail_exprs]
+
+    def _accumulate(self, row: dict, offset: int) -> None:
+        super()._accumulate(row, offset)
+        for col in self._colfail:
+            self._colfail[col] += int(row[f"colfail:{col}"] or 0)
+
+    # variation points
+    def _build_sample_expr(self, index: int, check: BoundCheck) -> pl.Expr:
+        return pl.struct(
+            (pl.col(ROW_IDX) + 1).alias("line"),
+            pl.col(check.column).cast(pl.Utf8).alias("value"),
+        )
+
+    def _sample_payload(self, check: BoundCheck, rec: dict) -> str:
+        value = rec["value"]
+        return value if value is not None else ""
+
+    def _assemble(self) -> list[ColumnData]:
+        """Regroup the flat results under their column, in schema order."""
+        return [
+            (col, self._colfail[col],
+             [(self._checks[i].check, self._counts[i], self._samples[i]) for i in idxs])
+            for col, idxs in self._col_indices.items()
+        ]
 
 
-def main():
-    args = sys.argv[1:]
-    sep = ";"
-    if args and args[0] == "--sep":
-        sep, args = args[1], args[2:]
-    pairs = list(zip(args[0::2], args[1::2]))
-    if len(pairs) < 3:
-        sys.exit("give at least 3 (schema csv) pairs spanning your file diversity")
+# --------------------------------------------------------------------------- #
+# Row checks: cross-column; sample shows the involved columns; flat result
+# --------------------------------------------------------------------------- #
+class RowRunner(MaskProcessor):
+    """Cross-column integrity checks. Nearly empty — only the two variation points."""
 
-    per_file, X, Y = [], [], []
-    for schema, csv in pairs:
-        W = w_of(schema); pts = []
-        for b in BATCHES:
-            pk = measure(schema, csv, sep, b); X.append(b * W); Y.append(pk); pts.append((b, W, pk))
-        per_file.append(pts)
-        print(f"{Path(schema).name}: W={W:.0f}  peaks={[round(p) for _, _, p in pts]}")
+    def __init__(self, checks: list[RowCheck], sample_size: int, engine: str = "streaming") -> None:
+        super().__init__(checks, sample_size, engine)
 
-    rmse, base, coeff, p = fit(np.array(X), np.array(Y))
-    print(f"\nfit: mem_base={base:.0f}  mem_coeff={coeff:.5f}  mem_exponent={p:.3f}  (RMSE={rmse:.0f} MB)")
+    def _build_sample_expr(self, index: int, check: RowCheck) -> pl.Expr:
+        return pl.struct(
+            (pl.col(ROW_IDX) + 1).alias("line"),
+            *[pl.col(c).cast(pl.Utf8).alias(c) for c in check.columns],
+        )
 
-    errs = []
-    for i, pts in enumerate(per_file):
-        tr = [(b * w, pk) for j, o in enumerate(per_file) if j != i for b, w, pk in o]
-        tx, ty = np.array([a for a, _ in tr]), np.array([a for _, a in tr])
-        _, b0, c0, p0 = fit(tx, ty)
-        for b, w, pk in pts:
-            errs.append(abs(b0 + c0 * (b * w) ** p0 - pk) / pk)
-    print(f"leave-one-file-out: mean|err|={np.mean(errs)*100:.1f}%  max|err|={np.max(errs)*100:.1f}%")
-    print(f"\n    EngineConfig(mem_base={base:.0f}, mem_coeff={coeff:.5f}, mem_exponent={p:.3f})")
+    def _sample_payload(self, check: RowCheck, rec: dict) -> dict[str, str]:
+        return {c: (rec[c] if rec[c] is not None else "") for c in check.columns}
 
-
-if __name__ == "__main__":
-    main()
+    def _assemble(self) -> list[RowData]:
+        return [(chk.name, self._counts[i], self._samples[i]) for i, chk in enumerate(self._checks)]

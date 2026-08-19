@@ -1,197 +1,146 @@
-"""PROTOTYPE (row) — typed constraint definitions + a column-style registry.
+"""PROTOTYPE — structure checks with a registry, mirroring rows and columns.
 
-Definitions are typed dataclasses (Compare(left, op, right), ...), each with
-from_dict / columns() / invalid() / to_check() — same as before.
+Same shape as the row side:
+    RowConstraint (ABC)          ->  StructureCheck (ABC)
+    Compare, RequiredIf, ...      ->  HeaderCheck, MaxColumns, ...   (typed classes)
+    RowConstraintRegistry        ->  StructureCheckRegistry
+    default_row_registry()       ->  default_structure_registry()
+    activated by "rowConstraints"->  activated by "structureChecks"
 
-The registry behaves like the column one: a LIST of registered units, `register`,
-and selection by ITERATING and asking `applies(...)` (not a dict lookup by kind).
-The one inherent difference: column registers stateless INSTANCES (params live on
-ColumnDef), while a row constraint carries its own params, so we register the
-CLASSES and `applies` is a classmethod. The mechanics are otherwise identical.
-Not wired into the package.
+The JSON declares which structure checks to apply; the registry maps `kind` -> class,
+reads the params via `from_dict`, VALIDATES (unknown kind / missing param) before
+adding, and returns the check instances the FileRunner runs. Not wired into the
+package (StructureIssue is a plain dataclass here; it would be the model on merge).
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-import polars as pl
-
-from mask_processors import RowCheck   # prototype dataclass: name / columns / invalid
+from csv_validator.models import ColumnDef, EngineConfig   # existing
 
 
-_OPS = {
-    ">": lambda a, b: a > b, ">=": lambda a, b: a >= b,
-    "<": lambda a, b: a < b, "<=": lambda a, b: a <= b,
-    "==": lambda a, b: a == b, "!=": lambda a, b: a != b,
-}
-
-
-def _typed(name: str, cast: str | None) -> pl.Expr:
-    """Column `name` (Utf8) coerced to the type needed for a comparison."""
-    e = pl.col(name).cast(pl.Utf8)
-    if cast == "date":
-        return e.str.to_date(strict=False)
-    if cast == "timestamp":
-        return e.str.to_datetime(strict=False)
-    if cast in ("number", "integer"):
-        return e.cast(pl.Float64 if cast == "number" else pl.Int64, strict=False)
-    return e
+@dataclass
+class StructureIssue:
+    check: str
+    code: str
+    message: str
+    columns: list[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
-# base (mirrors Constraint; `applies` mirrors the column validator's applies)
+# base — mirrors RowConstraint
 # --------------------------------------------------------------------------- #
-class RowConstraint(ABC):
-    """A typed cross-column rule. Registered classes are selected via `applies`."""
+class StructureCheck(ABC):
+    """A file-structure check, declared by the schema and built by the registry."""
 
-    kind = "row"
+    kind: str = "structure"
+    name: str = "structure"
 
-    @classmethod
-    def applies(cls, d: dict) -> bool:
-        """Whether this constraint handles that definition (by default, by kind)."""
-        return d.get("kind") == cls.kind
+    def issue(self, code: str, message: str, columns: list[str] | None = None) -> StructureIssue:
+        return StructureIssue(check=self.name, code=code, message=message, columns=columns or [])
+
+    @abstractmethod
+    def check(self, columns: list[ColumnDef], actual: list[str], config: EngineConfig) -> list[StructureIssue]:
+        """The issues this check finds, empty when the header satisfies it."""
 
     @classmethod
     @abstractmethod
-    def from_dict(cls, d: dict) -> "RowConstraint":
-        """Build the typed instance from its schema definition."""
-
-    @abstractmethod
-    def columns(self) -> list[str]:
-        """Columns this rule involves (for the sample)."""
-
-    @abstractmethod
-    def invalid(self) -> pl.Expr:
-        """Boolean mask, True where a row violates the rule."""
-
-    def to_check(self) -> RowCheck:
-        return RowCheck(name=self.name, columns=self.columns(), invalid=self.invalid())
+    def from_dict(cls, d: dict) -> "StructureCheck":
+        """Build a typed instance from its schema definition."""
 
 
 # --------------------------------------------------------------------------- #
-# typed constraints (definitions as before)
+# concrete checks — typed, each carrying only its own params
 # --------------------------------------------------------------------------- #
-@dataclass
-class Compare(RowConstraint):
-    """`left op right` must hold (e.g. EndDate >= StartDate)."""
+class HeaderCheck(StructureCheck):
+    """The CSV columns must match the schema: presence, no extras, and order."""
 
-    kind = "compare"
-    name: str
-    left: str
-    op: str
-    right: str
-    cast: str | None = None
+    kind = "header"
+    name = "header"
 
-    def columns(self): return [self.left, self.right]
+    def check(self, columns, actual, config):
+        expected = [c.name for c in columns]
+        expected_set, actual_set = set(expected), set(actual)
+        issues: list[StructureIssue] = []
 
-    def invalid(self):
-        if self.op not in _OPS:
-            raise ValueError(f"compare: unknown op {self.op!r}")
-        return ~_OPS[self.op](_typed(self.left, self.cast), _typed(self.right, self.cast))
+        missing = [c for c in expected if c not in actual_set]
+        if missing:
+            issues.append(self.issue("missing_columns", f"missing columns: {', '.join(missing)}", missing))
 
-    @classmethod
-    def from_dict(cls, d):
-        return cls(name=d["name"], left=d["left"], op=d["op"], right=d["right"], cast=d.get("cast"))
+        unexpected = [c for c in actual if c not in expected_set]
+        if unexpected and not config.allow_extra_columns:
+            issues.append(self.issue("unexpected_columns",
+                                     f"unexpected columns: {', '.join(unexpected)}", unexpected))
 
-
-@dataclass
-class RequiredIf(RowConstraint):
-    """If `when_col == equals`, then `require` must be present (non-empty)."""
-
-    kind = "requiredIf"
-    name: str
-    when_col: str
-    equals: str
-    require: str
-
-    def columns(self): return [self.when_col, self.require]
-
-    def invalid(self):
-        req = pl.col(self.require).cast(pl.Utf8)
-        missing = req.is_null() | (req.str.len_chars() == 0)
-        return (pl.col(self.when_col).cast(pl.Utf8) == self.equals) & missing
+        if config.strict_column_order and not missing and (config.allow_extra_columns or not unexpected):
+            if [c for c in actual if c in expected_set] != expected:
+                issues.append(self.issue("out_of_order", "columns out of order"))
+        return issues
 
     @classmethod
-    def from_dict(cls, d):
-        return cls(name=d["name"], when_col=d["whenCol"], equals=d["equals"], require=d["require"])
+    def from_dict(cls, d: dict) -> "HeaderCheck":
+        return cls()
 
 
 @dataclass
-class Equals(RowConstraint):
-    """Two columns must hold the same value (e.g. Ccy == SettlementCcy)."""
+class MaxColumns(StructureCheck):
+    """The CSV must not have more than `limit` columns."""
 
-    kind = "equals"
-    name: str
-    left: str
-    right: str
+    kind = "maxColumns"
+    name = "max_columns"
+    limit: int
 
-    def columns(self): return [self.left, self.right]
-
-    def invalid(self):
-        return pl.col(self.left).cast(pl.Utf8) != pl.col(self.right).cast(pl.Utf8)
-
-    @classmethod
-    def from_dict(cls, d):
-        return cls(name=d["name"], left=d["left"], right=d["right"])
-
-
-@dataclass
-class MutuallyRequired(RowConstraint):
-    """Two columns must be present together or absent together."""
-
-    kind = "mutuallyRequired"
-    name: str
-    left: str
-    right: str
-
-    def columns(self): return [self.left, self.right]
-
-    def invalid(self):
-        def filled(c):
-            v = pl.col(c).cast(pl.Utf8)
-            return v.is_not_null() & (v.str.len_chars() > 0)
-        return filled(self.left) != filled(self.right)
+    def check(self, columns, actual, config):
+        if len(actual) > self.limit:
+            return [self.issue("too_many_columns", f"too many columns: {len(actual)} > {self.limit}")]
+        return []
 
     @classmethod
-    def from_dict(cls, d):
-        return cls(name=d["name"], left=d["left"], right=d["right"])
+    def from_dict(cls, d: dict) -> "MaxColumns":
+        if "limit" not in d:
+            raise ValueError("maxColumns: 'limit' is required")
+        return cls(limit=int(d["limit"]))
 
 
 # --------------------------------------------------------------------------- #
-# registry — list + register + iterate with applies (like the column registry)
+# registry — mirrors RowConstraintRegistry
 # --------------------------------------------------------------------------- #
-class RowConstraintRegistry:
-    """Holds constraint classes (built-in + custom) and builds RowChecks."""
+class StructureCheckRegistry:
+    """Holds the known structure-check classes (built-in + custom) and builds them."""
 
     def __init__(self) -> None:
-        self._units: list[type[RowConstraint]] = []
+        self._checks: list[type[StructureCheck]] = []              # like the column registry
 
-    def register(self, constraint_cls: type[RowConstraint]) -> "RowConstraintRegistry":
-        """Register a constraint class. Returns self for chaining."""
-        self._units.append(constraint_cls)
+    def register(self, check_cls: type[StructureCheck]) -> "StructureCheckRegistry":
+        """Register a check class (re-registering a `kind` replaces it). Chainable."""
+        self._checks = [c for c in self._checks if c.kind != check_cls.kind]
+        self._checks.append(check_cls)
         return self
 
-    def build(self, definitions: list[dict], columns: list[str]) -> list[RowCheck]:
-        """Build the RowChecks; validate the kind is known and the columns exist."""
-        known = set(columns)
-        checks: list[RowCheck] = []
+    def _resolve(self, kind: str) -> type[StructureCheck] | None:
+        return next((c for c in self._checks if c.kind == kind), None)
+
+    def build(self, definitions: list[dict]) -> list[StructureCheck]:
+        """Turn the schema's structure-check definitions into check instances.
+
+        Validates each: the `kind` must be known, and `from_dict` validates the
+        params — anything else raises a clear error, like the parser.
+        """
+        checks: list[StructureCheck] = []
         for d in definitions:
-            cls = next((u for u in self._units if u.applies(d)), None)   # like column: iterate + applies
+            kind = d.get("kind")
+            cls = self._resolve(kind)
             if cls is None:
-                raise ValueError(f"unknown row constraint kind: {d.get('kind')!r}")
-            constraint = cls.from_dict(d)
-            missing = [c for c in constraint.columns() if c not in known]
-            if missing:
-                raise ValueError(f"row constraint {constraint.name!r}: unknown column(s) {', '.join(missing)}")
-            checks.append(constraint.to_check())
+                raise ValueError(f"unknown structure check kind: {kind!r}")
+            checks.append(cls.from_dict(d))
         return checks
 
 
-def default_row_registry() -> RowConstraintRegistry:
-    """The built-in constraints (extend with `.register(MyConstraint)`)."""
-    reg = RowConstraintRegistry()
-    for cls in (Compare, RequiredIf, Equals, MutuallyRequired):
+def default_structure_registry() -> StructureCheckRegistry:
+    """The built-in structure checks (extend with `.register(MyCheck)`)."""
+    reg = StructureCheckRegistry()
+    for cls in (HeaderCheck, MaxColumns):
         reg.register(cls)
     return reg

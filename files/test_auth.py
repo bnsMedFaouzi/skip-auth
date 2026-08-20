@@ -1,24 +1,22 @@
-"""PROTOTYPE — structure checks with a registry, mirroring rows and columns.
+"""PROTOTYPE (structure) — same pattern as rows/columns, with a global context.
 
-Same shape as the row side:
-    RowConstraint (ABC)          ->  StructureCheck (ABC)
-    Compare, RequiredIf, ...      ->  HeaderCheck, MaxColumns, ...   (typed classes)
-    RowConstraintRegistry        ->  StructureCheckRegistry
-    default_row_registry()       ->  default_structure_registry()
-    activated by "rowConstraints"->  activated by "structureChecks"
+Every structure check receives ONE global object (`FileContext`) that carries all
+it might need: the schema columns, the actual header, the config, the file name and
+the row count. So a check inspects only what it cares about (header -> columns,
+notEmpty -> rows, fileName -> name) through a single, uniform argument.
 
-The JSON declares which structure checks to apply; the registry maps `kind` -> class,
-reads the params via `from_dict`, VALIDATES (unknown kind / missing param) before
-adding, and returns the check instances the FileRunner runs. Not wired into the
-package (StructureIssue is a plain dataclass here; it would be the model on merge).
+Registry mirrors rows: a LIST of check classes, `register`, selection by iterating
+with `applies`, construction via `from_dict`, validation before adding. The header
+is just one check among others. Not wired into the package.
 """
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
-from csv_validator.models import ColumnDef, EngineConfig   # existing
+from csv_validator.models import ColumnDef, EngineConfig
 
 
 @dataclass
@@ -29,30 +27,45 @@ class StructureIssue:
     columns: list[str] = field(default_factory=list)
 
 
+@dataclass
+class FileContext:
+    """The global object handed to every structure check (everything it may inspect)."""
+
+    name: str                      # file / source name
+    expected: list[ColumnDef]      # schema columns (normalized), in order
+    actual: list[str]              # actual CSV header
+    config: EngineConfig
+    rows: int | None = None        # row count (known after the pass; None before)
+
+
 # --------------------------------------------------------------------------- #
-# base — mirrors RowConstraint
+# base (mirrors RowConstraint: classmethod applies + from_dict)
 # --------------------------------------------------------------------------- #
 class StructureCheck(ABC):
-    """A file-structure check, declared by the schema and built by the registry."""
+    """A file-structure check. Registered classes are selected via `applies`."""
 
-    kind: str = "structure"
-    name: str = "structure"
+    kind = "structure"
+    name = "structure"
 
-    def issue(self, code: str, message: str, columns: list[str] | None = None) -> StructureIssue:
-        return StructureIssue(check=self.name, code=code, message=message, columns=columns or [])
-
-    @abstractmethod
-    def check(self, columns: list[ColumnDef], actual: list[str], config: EngineConfig) -> list[StructureIssue]:
-        """The issues this check finds, empty when the header satisfies it."""
+    @classmethod
+    def applies(cls, d: dict) -> bool:
+        return d.get("kind") == cls.kind
 
     @classmethod
     @abstractmethod
     def from_dict(cls, d: dict) -> "StructureCheck":
-        """Build a typed instance from its schema definition."""
+        """Build the check from its schema definition."""
+
+    @abstractmethod
+    def check(self, ctx: FileContext) -> list[StructureIssue]:
+        """The issues this check finds, empty when the file satisfies it."""
+
+    def issue(self, code: str, message: str, columns: list[str] | None = None) -> StructureIssue:
+        return StructureIssue(check=self.name, code=code, message=message, columns=columns or [])
 
 
 # --------------------------------------------------------------------------- #
-# concrete checks — typed, each carrying only its own params
+# concrete checks — each reads only what it needs from the context
 # --------------------------------------------------------------------------- #
 class HeaderCheck(StructureCheck):
     """The CSV columns must match the schema: presence, no extras, and order."""
@@ -60,22 +73,22 @@ class HeaderCheck(StructureCheck):
     kind = "header"
     name = "header"
 
-    def check(self, columns, actual, config):
-        expected = [c.name for c in columns]
-        expected_set, actual_set = set(expected), set(actual)
+    def check(self, ctx: FileContext) -> list[StructureIssue]:
+        expected = [c.name for c in ctx.expected]
+        expected_set, actual_set = set(expected), set(ctx.actual)
         issues: list[StructureIssue] = []
 
         missing = [c for c in expected if c not in actual_set]
         if missing:
             issues.append(self.issue("missing_columns", f"missing columns: {', '.join(missing)}", missing))
 
-        unexpected = [c for c in actual if c not in expected_set]
-        if unexpected and not config.allow_extra_columns:
+        unexpected = [c for c in ctx.actual if c not in expected_set]
+        if unexpected and not ctx.config.allow_extra_columns:
             issues.append(self.issue("unexpected_columns",
                                      f"unexpected columns: {', '.join(unexpected)}", unexpected))
 
-        if config.strict_column_order and not missing and (config.allow_extra_columns or not unexpected):
-            if [c for c in actual if c in expected_set] != expected:
+        if ctx.config.strict_column_order and not missing and (ctx.config.allow_extra_columns or not unexpected):
+            if [c for c in ctx.actual if c in expected_set] != expected:
                 issues.append(self.issue("out_of_order", "columns out of order"))
         return issues
 
@@ -92,9 +105,9 @@ class MaxColumns(StructureCheck):
     name = "max_columns"
     limit: int
 
-    def check(self, columns, actual, config):
-        if len(actual) > self.limit:
-            return [self.issue("too_many_columns", f"too many columns: {len(actual)} > {self.limit}")]
+    def check(self, ctx: FileContext) -> list[StructureIssue]:
+        if len(ctx.actual) > self.limit:
+            return [self.issue("too_many_columns", f"too many columns: {len(ctx.actual)} > {self.limit}")]
         return []
 
     @classmethod
@@ -104,36 +117,62 @@ class MaxColumns(StructureCheck):
         return cls(limit=int(d["limit"]))
 
 
+class NotEmpty(StructureCheck):
+    """The file must contain at least one data row (uses the row count)."""
+
+    kind = "notEmpty"
+    name = "not_empty"
+
+    def check(self, ctx: FileContext) -> list[StructureIssue]:
+        if ctx.rows is not None and ctx.rows == 0:
+            return [self.issue("empty_file", "file has no data rows")]
+        return []
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "NotEmpty":
+        return cls()
+
+
+@dataclass
+class FileNameMatches(StructureCheck):
+    """The source file name must match a regex `pattern` (uses the file name)."""
+
+    kind = "fileName"
+    name = "file_name"
+    pattern: str
+
+    def check(self, ctx: FileContext) -> list[StructureIssue]:
+        if re.search(self.pattern, ctx.name) is None:
+            return [self.issue("bad_file_name", f"file name {ctx.name!r} does not match {self.pattern!r}")]
+        return []
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "FileNameMatches":
+        if "pattern" not in d:
+            raise ValueError("fileName: 'pattern' is required")
+        return cls(pattern=d["pattern"])
+
+
 # --------------------------------------------------------------------------- #
-# registry — mirrors RowConstraintRegistry
+# registry — list + register + iterate with applies (like rows/columns)
 # --------------------------------------------------------------------------- #
 class StructureCheckRegistry:
-    """Holds the known structure-check classes (built-in + custom) and builds them."""
+    """Holds structure-check classes (built-in + custom) and builds them from the schema."""
 
     def __init__(self) -> None:
-        self._checks: list[type[StructureCheck]] = []              # like the column registry
+        self._units: list[type[StructureCheck]] = []
 
     def register(self, check_cls: type[StructureCheck]) -> "StructureCheckRegistry":
-        """Register a check class (re-registering a `kind` replaces it). Chainable."""
-        self._checks = [c for c in self._checks if c.kind != check_cls.kind]
-        self._checks.append(check_cls)
+        self._units.append(check_cls)
         return self
 
-    def _resolve(self, kind: str) -> type[StructureCheck] | None:
-        return next((c for c in self._checks if c.kind == kind), None)
-
     def build(self, definitions: list[dict]) -> list[StructureCheck]:
-        """Turn the schema's structure-check definitions into check instances.
-
-        Validates each: the `kind` must be known, and `from_dict` validates the
-        params — anything else raises a clear error, like the parser.
-        """
+        """Build the checks; validate the kind is known and the params via from_dict."""
         checks: list[StructureCheck] = []
         for d in definitions:
-            kind = d.get("kind")
-            cls = self._resolve(kind)
+            cls = next((u for u in self._units if u.applies(d)), None)
             if cls is None:
-                raise ValueError(f"unknown structure check kind: {kind!r}")
+                raise ValueError(f"unknown structure check kind: {d.get('kind')!r}")
             checks.append(cls.from_dict(d))
         return checks
 
@@ -141,6 +180,6 @@ class StructureCheckRegistry:
 def default_structure_registry() -> StructureCheckRegistry:
     """The built-in structure checks (extend with `.register(MyCheck)`)."""
     reg = StructureCheckRegistry()
-    for cls in (HeaderCheck, MaxColumns):
+    for cls in (HeaderCheck, MaxColumns, NotEmpty, FileNameMatches):
         reg.register(cls)
     return reg

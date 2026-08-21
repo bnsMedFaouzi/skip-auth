@@ -1,26 +1,10 @@
-# jwt_decoder
-
-## Purpose
-Utility module for decoding and validating JWTs (JSON Web Tokens) used by TAASe clients. Isolates token parsing/verification logic from the rest of the client code.
-
-## Structure
-| File            | Role                                                      |
-|-----------------|-------------------------------------------------------------|
-| `__init__.py`   | Package entry point, exposes public classes/functions |
-| `jwt.py`        | Core logic: decoding, signature verification, claims extraction |
-| `settings.py`   | Configuration (public key, algorithm, audience, issuer...) |
-| `token.py`      | Model/object representing a decoded token and its accessors |
-
-## Dependencies
-- `PyJWT` (or equivalent) for decoding/verification
-- `pydantic` / `pydantic-settings` for configuration and claims validation
-
-## Typical usage
-```python
-from jwt_decoder.token import decode_token
-
-claims = decode_token(raw_jwt)
-```
-
-## Notes
-- Make sure the verification parameters (algorithm, key, audience) in `settings.py` match the token issuer (TAASe / IdP).
+def peek(self, n: int) -> list[str]:
+    """First `n` non-empty lines (raw text), read cheaply without scanning the file."""
+    out: list[str] = []
+    with open(self._path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                out.append(line.rstrip("\n"))
+                if len(out) >= n:
+                    break
+    return out

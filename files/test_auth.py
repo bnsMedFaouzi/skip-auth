@@ -68,11 +68,19 @@ class StructureCheck(ABC):
 # --------------------------------------------------------------------------- #
 # concrete checks — each reads only what it needs from the context
 # --------------------------------------------------------------------------- #
+@dataclass
 class HeaderCheck(StructureCheck):
-    """The CSV columns must match the schema: presence, no extras, and order."""
+    """The CSV columns must match the schema: presence, no extras, and order.
+
+    How it validates is declared in the JSON, not read from the global config:
+    `strictOrder` (columns must be in schema order) and `allowExtra` (tolerate
+    columns absent from the schema).
+    """
 
     kind = "header"
     name = "header"
+    strict_order: bool = True
+    allow_extra: bool = False
 
     def check(self, ctx: FileContext) -> list[StructureIssue]:
         expected = [c.name for c in ctx.expected]
@@ -84,18 +92,19 @@ class HeaderCheck(StructureCheck):
             issues.append(self.issue("missing_columns", f"missing columns: {', '.join(missing)}", missing))
 
         unexpected = [c for c in ctx.actual if c not in expected_set]
-        if unexpected and not ctx.config.allow_extra_columns:
+        if unexpected and not self.allow_extra:
             issues.append(self.issue("unexpected_columns",
                                      f"unexpected columns: {', '.join(unexpected)}", unexpected))
 
-        if ctx.config.strict_column_order and not missing and (ctx.config.allow_extra_columns or not unexpected):
+        if self.strict_order and not missing and (self.allow_extra or not unexpected):
             if [c for c in ctx.actual if c in expected_set] != expected:
                 issues.append(self.issue("out_of_order", "columns out of order"))
         return issues
 
     @classmethod
     def from_dict(cls, d: dict) -> "HeaderCheck":
-        return cls()
+        return cls(strict_order=bool(d.get("strictOrder", True)),
+                   allow_extra=bool(d.get("allowExtra", False)))
 
 
 @dataclass

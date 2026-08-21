@@ -35,7 +35,7 @@ class FileContext:
     expected: list[ColumnDef]      # schema columns (normalized), in order
     actual: list[str]              # actual CSV header
     config: EngineConfig
-    path: str | None = None        # file path, for early checks that peek the file
+    source: object | None = None   # the DataSource, for early checks that peek (source.peek(n))
     rows: int | None = None        # row count (known after the pass; None before)
 
 
@@ -138,16 +138,9 @@ class NotEmpty(StructureCheck):
     name = "not_empty"
 
     def check(self, ctx: FileContext) -> list[StructureIssue]:
-        if ctx.path is None:
+        if ctx.source is None:
             return []                                          # nothing to peek
-        seen = 0
-        with open(ctx.path, encoding="utf-8") as f:
-            for line in f:
-                if line.strip():                               # ignore blank lines
-                    seen += 1
-                    if seen >= 2:
-                        break
-        if seen < 2:
+        if len(ctx.source.peek(2)) < 2:                        # header + at least one data row
             return [self.issue("too_few_lines", "file must contain a header and at least one data row")]
         return []
 

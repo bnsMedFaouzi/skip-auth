@@ -1,201 +1,235 @@
-"""PROTOTYPE (structure) — same pattern as rows/columns, with a global context.
+"""PROTOTYPE — not wired into the package (no codebase changes).
 
-Every structure check receives ONE global object (`FileContext`) that carries all
-it might need: the schema columns, the actual header, the config, the file name and
-the row count. So a check inspects only what it cares about (header -> columns,
-notEmpty -> rows, fileName -> name) through a single, uniform argument.
+Shows the three classes we discussed:
 
-Registry mirrors rows: a LIST of check classes, `register`, selection by iterating
-with `applies`, construction via `from_dict`, validation before adding. The header
-is just one check among others. Not wired into the package.
+  MaskProcessor  (base)  — evaluate a set of named boolean masks over a block in a
+                           single Polars collect, and accumulate per-mask a failing
+                           count + a bounded sample (absolute line no. + value(s)).
+  ColumnRunner   (sub)   — per-column checks; adds the per-column failing-row count
+                           and regroups results under each column (today's behavior).
+  RowRunner      (sub)   — cross-column integrity checks; sample shows the involved
+                           columns; flat result list. Almost empty — the sign the
+                           split is right.
+
+Only `_build_sample_expr`, `_sample_payload` and `_assemble` vary between the two
+subclasses; everything else lives once in the base. Both run as independent
+`BlockProcessor`s (separate collect each) — the Runner already accepts a list.
 """
 
 from __future__ import annotations
 
-import re
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Any
 
-from csv_validator.models import ColumnDef, EngineConfig
+import polars as pl
 
+from csv_validator.models import BoundCheck          # existing: .column / .check / .invalid
+from csv_validator.execution.runner import BlockProcessor
 
-@dataclass
-class StructureIssue:
-    check: str
-    code: str
-    message: str
-    columns: list[str] = field(default_factory=list)
-
-
-@dataclass
-class FileContext:
-    """The global object handed to every structure check (everything it may inspect)."""
-
-    name: str                      # file / source name
-    expected: list[ColumnDef]      # schema columns (normalized), in order
-    actual: list[str]              # actual CSV header
-    config: EngineConfig
-    source: object | None = None   # the DataSource, for early checks that peek (source.peek(n))
-    rows: int | None = None        # row count (known after the pass; None before)
+ROW_IDX = "__row__"  # transient per-block row index used to number samples
 
 
 # --------------------------------------------------------------------------- #
-# base (mirrors RowConstraint: classmethod applies + from_dict)
-# --------------------------------------------------------------------------- #
-class StructureCheck(ABC):
-    """A file-structure check. Registered classes are selected via `applies`."""
-
-    kind = "structure"
-    name = "structure"
-
-    @classmethod
-    def applies(cls, d: dict) -> bool:
-        return d.get("kind") == cls.kind
-
-    @classmethod
-    @abstractmethod
-    def from_dict(cls, d: dict) -> "StructureCheck":
-        """Build the check from its schema definition."""
-
-    @abstractmethod
-    def check(self, ctx: FileContext) -> list[StructureIssue]:
-        """The issues this check finds, empty when the file satisfies it."""
-
-    def issue(self, code: str, message: str, columns: list[str] | None = None) -> StructureIssue:
-        return StructureIssue(check=self.name, code=code, message=message, columns=columns or [])
-
-
-# --------------------------------------------------------------------------- #
-# concrete checks — each reads only what it needs from the context
+# The cross-column rule object (mirrors BoundCheck; would live in validators/rows)
 # --------------------------------------------------------------------------- #
 @dataclass
-class HeaderCheck(StructureCheck):
-    """The CSV columns must match the schema: presence, no extras, and order.
+class RowCheck:
+    """A vectorized integrity rule over a whole row: name, involved columns, mask."""
 
-    How it validates is declared in the JSON, not read from the global config:
-    `strictOrder` (columns must be in schema order) and `allowExtra` (tolerate
-    columns absent from the schema).
+    name: str
+    columns: list[str]
+    invalid: pl.Expr            # boolean expr combining several columns; True = violation
+
+
+# Result shapes
+CheckData = tuple[str, int, list[tuple[int, Any]]]     # (name, error_count, sample)
+ColumnData = tuple[str, int, list[CheckData]]          # (column, failing_rows, checks)
+RowData = CheckData                                    # (name, error_count, sample)
+
+
+# --------------------------------------------------------------------------- #
+# Base: one collect over a block -> counts + bounded samples per mask
+# --------------------------------------------------------------------------- #
+class MaskProcessor(BlockProcessor):
+    """Evaluate named boolean masks over each block and accumulate their results.
+
+    Knows nothing about "column" or "row": it works on any objects exposing an
+    ``.invalid`` Polars expression. Per block it runs ONE streaming collect that
+    computes, for every mask ``m{i}``: the failing count and a bounded sample.
+    Subclasses decide only what a sample looks like and how to shape the result.
     """
 
-    kind = "header"
-    name = "header"
-    strict_order: bool = True
-    allow_extra: bool = False
+    def __init__(self, checks: list[Any], sample_size: int, engine: str = "streaming") -> None:
+        self._checks = list(checks)                       # each exposes `.invalid`
+        self._sample_size = sample_size
+        self._engine = engine
+        # Data-independent expressions, built once and reused every block.
+        self._masks = self._mask_exprs()
+        self._rows_expr = pl.len().alias("rows")
+        self._count_exprs = self._make_count_exprs()
+        self._sample_exprs = self._make_sample_exprs()
+        # Accumulators, parallel to `_checks`.
+        self._counts = [0] * len(self._checks)
+        self._samples: list[list[tuple[int, Any]]] = [[] for _ in self._checks]
+        self._needs_sample = [sample_size > 0 for _ in self._checks]
 
-    def check(self, ctx: FileContext) -> list[StructureIssue]:
-        expected = [c.name for c in ctx.expected]
-        expected_set, actual_set = set(expected), set(ctx.actual)
-        issues: list[StructureIssue] = []
+    # -- BlockProcessor interface ------------------------------------------- #
+    def update(self, block: pl.LazyFrame, offset: int) -> int:
+        """Evaluate one block, fold it in, and return its row count.
 
-        missing = [c for c in expected if c not in actual_set]
-        if missing:
-            issues.append(self.issue("missing_columns", f"missing columns: {', '.join(missing)}", missing))
+        ``offset`` (rows seen before this block) makes sample line numbers absolute.
+        """
+        row = self._evaluate(block)
+        self._accumulate(row, offset)
+        return int(row["rows"])
 
-        unexpected = [c for c in ctx.actual if c not in expected_set]
-        if unexpected and not self.allow_extra:
-            issues.append(self.issue("unexpected_columns",
-                                     f"unexpected columns: {', '.join(unexpected)}", unexpected))
+    def result(self) -> Any:
+        return self._assemble()
 
-        if self.strict_order and not missing and (self.allow_extra or not unexpected):
-            if [c for c in ctx.actual if c in expected_set] != expected:
-                issues.append(self.issue("out_of_order", "columns out of order"))
-        return issues
+    # -- one Polars pass over one block ------------------------------------- #
+    def _evaluate(self, block: pl.LazyFrame) -> dict:
+        """Attach masks + aggregates to the lazy block, collect once, return one row."""
+        return (
+            block.with_row_index(ROW_IDX)
+            .with_columns(self._masks)
+            .select(self._aggregates())
+            .collect(engine=self._engine)
+            .row(0, named=True)
+        )
 
-    @classmethod
-    def from_dict(cls, d: dict) -> "HeaderCheck":
-        return cls(strict_order=bool(d.get("strictOrder", True)),
-                   allow_extra=bool(d.get("allowExtra", False)))
+    def _aggregates(self) -> list[pl.Expr]:
+        """Row count, per-mask counts, and the samples still being collected."""
+        samples = [self._sample_exprs[i] for i in range(len(self._checks)) if self._needs_sample[i]]
+        return [self._rows_expr, *self._count_exprs, *samples]
 
+    # -- expression builders (each list built once) ------------------------- #
+    def _mask_exprs(self) -> list[pl.Expr]:
+        """One invalid-mask ``m{i}`` per check (null cells are not invalid here)."""
+        return [chk.invalid.fill_null(False).alias(f"m{i}") for i, chk in enumerate(self._checks)]
 
-@dataclass
-class MaxColumns(StructureCheck):
-    """The CSV must not have more than `limit` columns."""
+    def _make_count_exprs(self) -> list[pl.Expr]:
+        """One failing-row count per mask (the sum of its mask)."""
+        return [pl.col(f"m{i}").sum().alias(f"count:{i}") for i in range(len(self._checks))]
 
-    kind = "maxColumns"
-    name = "max_columns"
-    limit: int
+    def _make_sample_exprs(self) -> list[pl.Expr]:
+        """One bounded sample per mask; the projection is subclass-specific."""
+        return [
+            self._build_sample_expr(i, chk)
+            .filter(pl.col(f"m{i}"))
+            .head(self._sample_size)
+            .implode()
+            .alias(f"sample:{i}")
+            for i, chk in enumerate(self._checks)
+        ]
 
-    def check(self, ctx: FileContext) -> list[StructureIssue]:
-        if len(ctx.actual) > self.limit:
-            return [self.issue("too_many_columns", f"too many columns: {len(ctx.actual)} > {self.limit}")]
-        return []
+    # -- accumulation across blocks ----------------------------------------- #
+    def _accumulate(self, row: dict, offset: int) -> None:
+        """Add one block's counts and samples to the totals."""
+        for i in range(len(self._checks)):
+            self._counts[i] += int(row[f"count:{i}"] or 0)
+            if self._needs_sample[i]:
+                self._collect_sample(i, row, offset)
 
-    @classmethod
-    def from_dict(cls, d: dict) -> "MaxColumns":
-        if "limit" not in d:
-            raise ValueError("maxColumns: 'limit' is required")
-        return cls(limit=int(d["limit"]))
+    def _collect_sample(self, i: int, row: dict, offset: int) -> None:
+        """Append mask ``i``'s sample rows (offset-shifted), stopping once it is full."""
+        for rec in row[f"sample:{i}"] or []:
+            if len(self._samples[i]) >= self._sample_size:
+                self._needs_sample[i] = False
+                return
+            line = offset + int(rec["line"])
+            self._samples[i].append((line, self._sample_payload(self._checks[i], rec)))
 
+    # -- variation points (subclasses) -------------------------------------- #
+    def _build_sample_expr(self, index: int, check: Any) -> pl.Expr:
+        """The struct projected for a sample row (must include a ``line`` field)."""
+        raise NotImplementedError
 
-class NotEmpty(StructureCheck):
-    """The file must contain at least two lines (a header + one data row).
+    def _sample_payload(self, check: Any, rec: dict) -> Any:
+        """Turn one collected sample struct into the stored value(s)."""
+        raise NotImplementedError
 
-    An EARLY check: it peeks the file (reads at most two non-blank lines) instead
-    of waiting for the post-pass row count, so it can gate before the data pass.
-    """
-
-    kind = "notEmpty"
-    name = "not_empty"
-
-    def check(self, ctx: FileContext) -> list[StructureIssue]:
-        if ctx.source is None:
-            return []                                          # nothing to peek
-        if len(ctx.source.peek(2)) < 2:                        # header + at least one data row
-            return [self.issue("too_few_lines", "file must contain a header and at least one data row")]
-        return []
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "NotEmpty":
-        return cls()
-
-
-@dataclass
-class FileNameMatches(StructureCheck):
-    """The source file name must match a regex `pattern` (uses the file name)."""
-
-    kind = "fileName"
-    name = "file_name"
-    pattern: str
-
-    def check(self, ctx: FileContext) -> list[StructureIssue]:
-        if re.search(self.pattern, ctx.name) is None:
-            return [self.issue("bad_file_name", f"file name {ctx.name!r} does not match {self.pattern!r}")]
-        return []
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "FileNameMatches":
-        if "pattern" not in d:
-            raise ValueError("fileName: 'pattern' is required")
-        return cls(pattern=d["pattern"])
+    def _assemble(self) -> Any:
+        """Shape the accumulated results for the report."""
+        raise NotImplementedError
 
 
 # --------------------------------------------------------------------------- #
-# registry — list + register + iterate with applies (like rows/columns)
+# Column checks: + per-column failing-row count, regrouped by column
 # --------------------------------------------------------------------------- #
-class StructureCheckRegistry:
-    """Holds structure-check classes (built-in + custom) and builds them from the schema."""
+class ColumnRunner(MaskProcessor):
+    """Per-column checks. Adds the per-column failing-row count on top of the base."""
 
-    def __init__(self) -> None:
-        self._units: list[type[StructureCheck]] = []
+    def __init__(self, checks_by_column: dict[str, list[BoundCheck]], sample_size: int,
+                 engine: str = "streaming") -> None:
+        # Keep the column grouping from the INPUT DICT keys (names, hashable) instead
+        # of re-deriving it from chk.column: single pass, and no assumption on the
+        # check's fields.
+        flat: list[BoundCheck] = []
+        self._columns: list[str] = []                 # column name per flat check (index -> name)
+        self._col_indices: dict[str, list[int]] = {}  # column name -> its flat check indices
+        for col, chks in checks_by_column.items():
+            self._col_indices[col] = list(range(len(flat), len(flat) + len(chks)))
+            for chk in chks:
+                self._columns.append(col)
+                flat.append(chk)
+        super().__init__(flat, sample_size, engine)          # base handles masks/counts/samples
+        self._colfail_exprs = self._make_colfail_exprs()
+        self._colfail = {col: 0 for col in self._col_indices}
 
-    def register(self, check_cls: type[StructureCheck]) -> "StructureCheckRegistry":
-        self._units.append(check_cls)
-        return self
+    def _make_colfail_exprs(self) -> list[pl.Expr]:
+        """One failing-row count per column (a row failing several checks counts once)."""
+        return [
+            pl.any_horizontal([pl.col(f"m{k}") for k in idxs]).sum().alias(f"colfail:{col}")
+            for col, idxs in self._col_indices.items()
+        ]
 
-    def build(self, definitions: list[dict]) -> list[StructureCheck]:
-        """Build the checks; validate the kind is known and the params via from_dict."""
-        checks: list[StructureCheck] = []
-        for d in definitions:
-            cls = next((u for u in self._units if u.applies(d)), None)
-            if cls is None:
-                raise ValueError(f"unknown structure check kind: {d.get('kind')!r}")
-            checks.append(cls.from_dict(d))
-        return checks
+    # extend the base collect + accumulation with the per-column supplement
+    def _aggregates(self) -> list[pl.Expr]:
+        return [*super()._aggregates(), *self._colfail_exprs]
+
+    def _accumulate(self, row: dict, offset: int) -> None:
+        super()._accumulate(row, offset)
+        for col in self._colfail:
+            self._colfail[col] += int(row[f"colfail:{col}"] or 0)
+
+    # variation points
+    def _build_sample_expr(self, index: int, check: BoundCheck) -> pl.Expr:
+        col = self._columns[index]                    # name from the dict, never chk.column
+        return pl.struct(
+            (pl.col(ROW_IDX) + 1).alias("line"),
+            pl.col(col).cast(pl.Utf8).alias("value"),
+        )
+
+    def _sample_payload(self, check: BoundCheck, rec: dict) -> str:
+        value = rec["value"]
+        return value if value is not None else ""
+
+    def _assemble(self) -> list[ColumnData]:
+        """Regroup the flat results under their column, in schema order."""
+        return [
+            (col, self._colfail[col],
+             [(self._checks[i].check, self._counts[i], self._samples[i]) for i in idxs])
+            for col, idxs in self._col_indices.items()
+        ]
 
 
-def default_structure_registry() -> StructureCheckRegistry:
-    """The built-in structure checks (extend with `.register(MyCheck)`)."""
-    reg = StructureCheckRegistry()
-    for cls in (HeaderCheck, MaxColumns, NotEmpty, FileNameMatches):
-        reg.register(cls)
-    return reg
+# --------------------------------------------------------------------------- #
+# Row checks: cross-column; sample shows the involved columns; flat result
+# --------------------------------------------------------------------------- #
+class RowRunner(MaskProcessor):
+    """Cross-column integrity checks. Nearly empty — only the two variation points."""
+
+    def __init__(self, checks: list[RowCheck], sample_size: int, engine: str = "streaming") -> None:
+        super().__init__(checks, sample_size, engine)
+
+    def _build_sample_expr(self, index: int, check: RowCheck) -> pl.Expr:
+        return pl.struct(
+            (pl.col(ROW_IDX) + 1).alias("line"),
+            *[pl.col(c).cast(pl.Utf8).alias(c) for c in check.columns],
+        )
+
+    def _sample_payload(self, check: RowCheck, rec: dict) -> dict[str, str]:
+        return {c: (rec[c] if rec[c] is not None else "") for c in check.columns}
+
+    def _assemble(self) -> list[RowData]:
+        return [(chk.name, self._counts[i], self._samples[i]) for i, chk in enumerate(self._checks)]

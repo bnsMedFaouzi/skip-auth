@@ -2,8 +2,7 @@
 
 The origin of the bytes (local file or an S3/COS StreamingBody) is hidden behind
 a ByteStreamProvider. The source opens the stream ONCE and, from that single
-handle, in order: reads the header line (-> columns), lets callers peek ahead
-(buffered, not consumed), then yields row blocks (which drain the buffer first).
+handle, in order: reads the header line (-> columns), then yields row blocks.
 Works identically for a re-openable file and a read-once stream. Not wired in.
 """
 
@@ -74,17 +73,34 @@ class CsvDataSource:
         self._header_line: bytes | None = None
         self._columns: list[str] | None = None
         self._trailing_empty = False
-        self._buffered: list[bytes] = []          # data lines read ahead (peek), not yet yielded
-        self._exhausted = False
+        self._closed = False
 
     @property
     def name(self) -> str:
         return self._provider.name
 
+    # -- lifecycle: context manager (recommended) + idempotent close (safety net) #
+    def __enter__(self) -> "CsvDataSource":
+        self._ensure_open()
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self.close()
+        return False
+
+    def close(self) -> None:
+        """Close the underlying stream (incl. a StreamingBody). Idempotent."""
+        if self._fh is not None:
+            self._fh.close()                       # the source closes what it received
+            self._fh = None
+        self._closed = True
+
     # -- one open, header read once ----------------------------------------- #
     def _ensure_open(self) -> None:
         if self._fh is not None:
             return
+        if self._closed:
+            raise RuntimeError("data source already consumed/closed (single-pass)")
         self._fh = self._provider.open()
         self._header_line = self._fh.readline()
         raw = self._parse_header(self._header_line)
@@ -102,21 +118,9 @@ class CsvDataSource:
 
     # -- public API (all from the same pass) -------------------------------- #
     def columns(self) -> list[str]:
-        self._ensure_open()
+        if self._columns is None:                  # cached: readable even after close
+            self._ensure_open()
         return self._columns
-
-    def peek(self, n: int) -> list[str]:
-        """Up to `n` non-blank data lines, read ahead and BUFFERED (blocks keep them)."""
-        self._ensure_open()
-        non_blank = [ln for ln in self._buffered if ln.strip()]
-        while len(non_blank) < n:
-            line = self._fh.readline()
-            if not line:
-                break
-            self._buffered.append(line)
-            if line.strip():
-                non_blank.append(line)
-        return [ln.decode("utf-8", "replace").rstrip("\n") for ln in non_blank[:n]]
 
     def iter_frames(self, batch_size: int) -> Iterator[pl.LazyFrame]:
         """Yield lazy scans of `batch_size` rows; the first block drains the peek buffer."""
@@ -124,13 +128,9 @@ class CsvDataSource:
         keep = self._columns
         try:
             while True:
-                block = self._buffered            # start with what peek read ahead
-                self._buffered = []
-                if len(block) < batch_size:
-                    block = block + list(itertools.islice(self._fh, batch_size - len(block)))
+                block = list(itertools.islice(self._fh, batch_size))
                 if not block:
                     break
                 yield self._scan(io.BytesIO(self._header_line + b"".join(block))).select(keep)
         finally:
-            self._exhausted = True
-            self._fh.close()
+            self.close()                           # safety net: closes even without a `with`

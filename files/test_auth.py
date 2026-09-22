@@ -6,3 +6,8 @@ fs = s3fs.S3FileSystem(
 )
 with fs.open("bu002i010448/publication/.../fichier.csv", "rb") as f:
     df = pl.read_csv(f)
+
+
+
+
+https://www.rhosignal.com/posts/reading-from-s3-with-filters/

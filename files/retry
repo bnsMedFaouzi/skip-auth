@@ -1,10 +1,3 @@
-def peek(self, n: int) -> list[str]:
-    """First `n` non-empty lines (raw text), read cheaply without scanning the file."""
-    out: list[str] = []
-    with open(self._path, encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                out.append(line.rstrip("\n"))
-                if len(out) >= n:
-                    break
-    return out
+cache_regions=True,       # évite la détection de région à chaque nouveau bucket
+    version_aware=False,      # évite le listing complet des versions (défaut normalement)
+    skip_instance_cache=False

@@ -1,10 +1,2 @@
-import time
-
-for bs in [64*1024, 1024*1024, 8*1024*1024]:
-    t0 = time.perf_counter()
-    f = fs.open("bucket/fichier.csv", "rb", block_size=bs)
-    t1 = time.perf_counter()
-    f.read(100)
-    t2 = time.perf_counter()
-    f.close()
-    print(f"block_size={bs}: open={t1-t0:.2f}s, first_read={t2-t1:.2f}s")
+lazy_frame = pl.scan_csv(body, **polars_kwargs)
+        yield from lazy_frame.collect_batches(chunk_size=batch_size)

@@ -1,2 +1,2 @@
-lazy_frame = pl.scan_csv(body, **polars_kwargs)
-        yield from lazy_frame.collect_batches(chunk_size=batch_size)
+os.environ["POLARS_VERBOSE"] = "1"
+os.environ["RUST_LOG"] = "object_store=debug"
